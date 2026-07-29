@@ -19,6 +19,13 @@ jobs:
           java-version: '17'
           distribution: 'temurin'
 
+      - name: Setup Android SDK build tools
+        run: |
+          echo "y" | $ANDROID_HOME/cmdline-tools/latest/bin/sdkmanager \
+            "platforms;android-35" \
+            "build-tools;35.0.0" \
+            --sdk_root=$ANDROID_HOME 2>/dev/null || true
+
       - name: Setup Gradle
         uses: gradle/actions/setup-gradle@v4
 
