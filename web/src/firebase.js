@@ -10,24 +10,23 @@ import { getFirestore } from 'firebase/firestore';
 import { getFunctions } from 'firebase/functions';
 
 const firebaseConfig = {
-  apiKey: import.meta.env.VITE_FIREBASE_API_KEY,
-  authDomain: import.meta.env.VITE_FIREBASE_AUTH_DOMAIN,
-  projectId: import.meta.env.VITE_FIREBASE_PROJECT_ID,
-  storageBucket: import.meta.env.VITE_FIREBASE_STORAGE_BUCKET,
-  messagingSenderId: import.meta.env.VITE_FIREBASE_MESSAGING_SENDER_ID,
-  appId: import.meta.env.VITE_FIREBASE_APP_ID,
+  apiKey: import.meta.env.VITE_FIREBASE_API_KEY || 'AIzaSyAPF9ja04zGbYfHNv3bmNS9yeuYVr-fJGQ',
+  authDomain: import.meta.env.VITE_FIREBASE_AUTH_DOMAIN || 'kunjachaya-club.firebaseapp.com',
+  projectId: import.meta.env.VITE_FIREBASE_PROJECT_ID || 'kunjachaya-club',
+  storageBucket: import.meta.env.VITE_FIREBASE_STORAGE_BUCKET || 'kunjachaya-club.firebasestorage.app',
+  messagingSenderId: import.meta.env.VITE_FIREBASE_MESSAGING_SENDER_ID || '668738359171',
+  appId: import.meta.env.VITE_FIREBASE_APP_ID || '1:668738359171:web:kunjachaya-club',
 };
 
-if (!firebaseConfig.apiKey || !firebaseConfig.projectId) {
-  // Fail loudly in dev rather than silently running against an undefined project.
-  console.error(
-    'Firebase config is missing. Copy .env.example to .env.local and fill in your ' +
-    'Firebase project settings (Project Settings -> General -> Your apps -> SDK setup).'
-  );
+let app, auth, db, functions;
+try {
+  app = initializeApp(firebaseConfig);
+  auth = getAuth(app);
+  db = getFirestore(app);
+  functions = getFunctions(app, 'asia-southeast1');
+} catch (err) {
+  console.error('Firebase initialization error:', err);
 }
 
-export const app = initializeApp(firebaseConfig);
-export const auth = getAuth(app);
-export const db = getFirestore(app);
-// Must match the region set in functions/index.js (setGlobalOptions region).
-export const functions = getFunctions(app, 'asia-southeast1');
+export { app, auth, db, functions };
+
