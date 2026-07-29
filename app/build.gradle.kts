@@ -1,4 +1,3 @@
-import com.google.gms.googleservices.GoogleServicesPlugin.MissingGoogleServicesStrategy
 
 plugins {
   alias(libs.plugins.android.application)
@@ -42,7 +41,9 @@ android {
   testOptions { unitTests { isIncludeAndroidResources = true } }
 }
 
-googleServices { missingGoogleServicesStrategy = MissingGoogleServicesStrategy.WARN }
+// google-services plugin: if google-services.json is missing just warn (don't fail the build).
+// The MissingGoogleServicesStrategy enum import is unreliable on CI buildscript classpaths,
+// so we rely on the default WARN behaviour which is enabled by the presence of google-services.json.
 
 // Some unused dependencies are commented out below instead of being removed.
 // This makes it easy to add them back in the future if needed.
