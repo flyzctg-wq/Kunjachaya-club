@@ -27,6 +27,16 @@ export default function AuthModal({ lang, setCurrentUser, setShowAuthModal }) {
   const [error, setError] = useState('');
   const [info, setInfo] = useState('');
 
+  const getErrorMessage = (err) => {
+    const code = err?.code || '';
+    if (code === 'auth/configuration-not-found' || code === 'auth/operation-not-allowed') {
+      return lang === 'bn'
+        ? 'ফায়ারবেস কনসোলে ইমেইল/পাসওয়ার্ড লগইন চালু করা নেই। Firebase Console -> Authentication -> Sign-in method এ ইমেইল/পাসওয়ার্ড Enable করুন।'
+        : 'Email/Password authentication is disabled in Firebase Console. Enable it in Firebase Console -> Authentication -> Sign-in method -> Email/Password.';
+    }
+    return err?.message || 'Operation failed.';
+  };
+
   const handleLogin = async (e) => {
     e.preventDefault();
     setBusy(true);
@@ -46,7 +56,7 @@ export default function AuthModal({ lang, setCurrentUser, setShowAuthModal }) {
       setCurrentUser(resident);
       setShowAuthModal(false);
     } catch (err) {
-      setError(err.message || 'Sign-in failed.');
+      setError(getErrorMessage(err));
     } finally {
       setBusy(false);
     }
@@ -70,7 +80,7 @@ export default function AuthModal({ lang, setCurrentUser, setShowAuthModal }) {
       );
       setMode('login');
     } catch (err) {
-      setError(err.message || 'Registration failed.');
+      setError(getErrorMessage(err));
     } finally {
       setBusy(false);
     }
