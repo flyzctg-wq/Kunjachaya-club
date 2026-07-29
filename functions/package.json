@@ -1,0 +1,25 @@
+{
+  "name": "kunjachaya-club-functions",
+  "description": "Server-side Cloud Functions for Kunjachaya Resident Club — real bKash payment verification and role/authorization enforcement. Nothing in this package trusts client-submitted role or payment-status values.",
+  "engines": {
+    "node": "20"
+  },
+  "main": "index.js",
+  "scripts": {
+    "lint": "eslint .",
+    "serve": "firebase emulators:start --only functions",
+    "shell": "firebase functions:shell",
+    "start": "npm run shell",
+    "deploy": "firebase deploy --only functions",
+    "logs": "firebase functions:log"
+  },
+  "dependencies": {
+    "firebase-admin": "^12.6.0",
+    "firebase-functions": "^5.1.1",
+    "axios": "^1.7.7"
+  },
+  "devDependencies": {
+    "eslint": "^8.57.0"
+  },
+  "private": true
+}

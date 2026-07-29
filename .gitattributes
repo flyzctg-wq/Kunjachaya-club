@@ -1,0 +1,13 @@
+# Normalize line endings to LF in the repository, regardless of OS
+* text=auto eol=lf
+
+# Binary files — never touch line endings
+*.jpg binary
+*.jpeg binary
+*.png binary
+*.webp binary
+*.mp4 binary
+*.jks binary
+*.keystore binary
+*.apk binary
+*.aab binary

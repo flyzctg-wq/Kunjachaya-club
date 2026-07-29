@@ -1,0 +1,93 @@
+rules_version = '2';
+
+// These rules are the actual enforcement boundary. Everything in the client
+// apps (Android/web) that used to write financials/complaints/roles directly
+// must now go through the Cloud Functions in functions/index.js instead — this
+// file makes sure that's not optional.
+
+function isSignedIn() {
+  return request.auth != null;
+}
+
+function isAdmin() {
+  return isSignedIn() && request.auth.token.admin == true;
+}
+
+function isSuperAdmin() {
+  return isSignedIn() && request.auth.token.role == "SUPER_ADMIN";
+}
+
+function isOwner(resource) {
+  return isSignedIn() && resource.data.userId == request.resource.data.userId
+    && existsUserForUid(request.auth.uid, resource.data.userId);
+}
+
+function existsUserForUid(uid, userId) {
+  return get(/databases/$(database)/documents/users/$(userId)).data.firebaseUid == uid;
+}
+
+service cloud.firestore {
+  match /databases/{database}/documents {
+
+    match /users/{userId} {
+      allow read: if isSignedIn();
+      // Residents may edit their own contact/profile fields, but never role or
+      // membershipStatus — those two are admin/Cloud-Function-only.
+      allow update: if isSignedIn()
+        && resource.data.firebaseUid == request.auth.uid
+        && request.resource.data.role == resource.data.role
+        && request.resource.data.membershipStatus == resource.data.membershipStatus;
+      allow update: if isAdmin();
+      // Creation happens via the registerResident Cloud Function (Admin SDK),
+      // not directly from the client.
+      allow create: if false;
+      allow delete: if isAdmin();
+    }
+
+    match /financials/{recordId} {
+      allow read: if isSignedIn() && (
+        isAdmin() || existsUserForUid(request.auth.uid, resource.data.userId)
+      );
+      // No client writes at all. initiateBkashPayment / executeBkashPayment run
+      // under the Admin SDK and are the only path that can change this collection.
+      allow write: if false;
+    }
+
+    match /complaints/{complaintId} {
+      allow read: if isSignedIn() && (
+        isAdmin() || existsUserForUid(request.auth.uid, resource.data.userId)
+      );
+      allow create: if isSignedIn()
+        && existsUserForUid(request.auth.uid, request.resource.data.userId)
+        && request.resource.data.status == "Pending";
+      // Status/notes are admin-only, and only via the updateComplaintStatus function
+      // (still enforced here too, in case anyone ever adds a direct client call).
+      allow update: if isAdmin();
+      allow delete: if isAdmin();
+    }
+
+    match /announcements/{noticeId} {
+      allow read: if true; // public notices
+      allow write: if isAdmin();
+    }
+
+    match /Events/{eventId} {
+      allow read: if isSignedIn();
+      allow write: if isAdmin();
+    }
+
+    match /ActivityLogs/{logId} {
+      allow read: if isAdmin();
+      allow write: if false; // written by Cloud Functions only, via Admin SDK
+    }
+
+    // Workspace-level settings (currently just the archive/dissolve flag). Every
+    // client reads this to know whether to render a closed/read-only state.
+    // Only setWorkspaceArchived (Super-Admin-gated Cloud Function, Admin SDK)
+    // may write it — not even a regular Admin can flip this from the client.
+    match /clubSettings/{settingId} {
+      allow read: if true;
+      allow write: if false;
+    }
+  }
+}

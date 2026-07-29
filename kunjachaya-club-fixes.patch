@@ -1,0 +1,3999 @@
+diff --git a/app/build.gradle.kts b/app/build.gradle.kts
+index 357cd88..3862951 100644
+--- a/app/build.gradle.kts
++++ b/app/build.gradle.kts
+@@ -76,6 +76,7 @@ dependencies {
+   // implementation(libs.accompanist.permissions)
+   implementation(libs.androidx.activity.compose)
+   implementation(libs.androidx.biometric)
++  implementation(libs.androidx.browser)
+   implementation(libs.androidx.camera.camera2)
+   implementation(libs.androidx.camera.core)
+   implementation(libs.androidx.camera.lifecycle)
+diff --git a/app/src/main/AndroidManifest.xml b/app/src/main/AndroidManifest.xml
+index b0ad595..d5d6d76 100644
+--- a/app/src/main/AndroidManifest.xml
++++ b/app/src/main/AndroidManifest.xml
+@@ -27,6 +27,20 @@
+ 
+                 <category android:name="android.intent.category.LAUNCHER" />
+             </intent-filter>
++
++            <!-- Catches the redirect_url / cancel_url used in the PipraPay checkout flow
++                 (see ClubViewModel.initiatePipraPayCheckout / FinancialsScreen.kt). This
++                 is a convenience/fallback path only — the server-to-server webhook
++                 (functions/index.js: piprapayWebhook) is what actually confirms payment;
++                 this intent filter just brings the user back into the app afterward and
++                 lets confirmPipraPayCheckout run as a belt-and-suspenders check. -->
++            <intent-filter android:autoVerify="false">
++                <action android:name="android.intent.action.VIEW" />
++                <category android:name="android.intent.category.DEFAULT" />
++                <category android:name="android.intent.category.BROWSABLE" />
++                <data android:scheme="kunjachayaclub" android:host="payment-redirect" />
++                <data android:scheme="kunjachayaclub" android:host="payment-cancel" />
++            </intent-filter>
+         </activity>
+ 
+         <provider
+diff --git a/app/src/main/java/com/example/MainActivity.kt b/app/src/main/java/com/example/MainActivity.kt
+index 691e315..72466e9 100644
+--- a/app/src/main/java/com/example/MainActivity.kt
++++ b/app/src/main/java/com/example/MainActivity.kt
+@@ -120,20 +120,24 @@ class MainActivity : FragmentActivity() {
+                                         label = { Text(AppLanguage.financials(lang), fontSize = 10.sp, fontWeight = FontWeight.Bold) },
+                                         modifier = Modifier.testTag("nav_financials")
+                                     )
+-                                    NavigationBarItem(
+-                                        selected = currentTab == "admin",
+-                                        onClick = { currentTab = "admin" },
+-                                        icon = { Icon(Icons.Default.AdminPanelSettings, contentDescription = "Admin") },
+-                                        label = { Text(AppLanguage.admin(lang), fontSize = 10.sp, fontWeight = FontWeight.Bold) },
+-                                        modifier = Modifier.testTag("nav_admin")
+-                                    )
+-                                    NavigationBarItem(
+-                                        selected = currentTab == "schema",
+-                                        onClick = { currentTab = "schema" },
+-                                        icon = { Icon(Icons.Default.Code, contentDescription = "Schema") },
+-                                        label = { Text("Dev Docs", fontSize = 10.sp, fontWeight = FontWeight.Bold) },
+-                                        modifier = Modifier.testTag("nav_schema")
+-                                    )
++                                    if (currentUser?.role == "Admin") {
++                                        NavigationBarItem(
++                                            selected = currentTab == "admin",
++                                            onClick = { currentTab = "admin" },
++                                            icon = { Icon(Icons.Default.AdminPanelSettings, contentDescription = "Admin") },
++                                            label = { Text(AppLanguage.admin(lang), fontSize = 10.sp, fontWeight = FontWeight.Bold) },
++                                            modifier = Modifier.testTag("nav_admin")
++                                        )
++                                    }
++                                    if (currentUser?.role == "Admin") {
++                                        NavigationBarItem(
++                                            selected = currentTab == "schema",
++                                            onClick = { currentTab = "schema" },
++                                            icon = { Icon(Icons.Default.Code, contentDescription = "Schema") },
++                                            label = { Text("Dev Docs", fontSize = 10.sp, fontWeight = FontWeight.Bold) },
++                                            modifier = Modifier.testTag("nav_schema")
++                                        )
++                                    }
+                                 }
+                             }
+                         ) { innerPadding ->
+@@ -174,8 +178,8 @@ class MainActivity : FragmentActivity() {
+                                         complaintsViewModel = complaintsViewModel
+                                     )
+                                     "financials" -> FinancialsScreen(viewModel = viewModel)
+-                                    "admin" -> AdminPortalScreen(viewModel = viewModel)
+-                                    "schema" -> DevDocsScreen(viewModel = viewModel)
++                                    "admin" -> if (currentUser?.role == "Admin") AdminPortalScreen(viewModel = viewModel)
++                                    "schema" -> if (currentUser?.role == "Admin") DevDocsScreen(viewModel = viewModel)
+                                 }
+                             }
+                         }
+diff --git a/app/src/main/java/com/example/data/db/AppDatabase.kt b/app/src/main/java/com/example/data/db/AppDatabase.kt
+index 10f5948..0eae149 100644
+--- a/app/src/main/java/com/example/data/db/AppDatabase.kt
++++ b/app/src/main/java/com/example/data/db/AppDatabase.kt
+@@ -16,7 +16,7 @@ import com.example.data.model.*
+         ActivityLogEntity::class,
+         EventEntity::class
+     ],
+-    version = 3,
++    version = 4,
+     exportSchema = false
+ )
+ abstract class AppDatabase : RoomDatabase() {
+@@ -34,6 +34,13 @@ abstract class AppDatabase : RoomDatabase() {
+ 
+         fun getDatabase(context: Context): AppDatabase {
+             return INSTANCE ?: synchronized(this) {
++                // NOTE (DevOps): fallbackToDestructiveMigration() is fine while iterating on
++                // the schema pre-launch, because it silently deletes and recreates the local
++                // DB on any version bump. Once this app holds real resident data in the field,
++                // replace this with explicit Migration(x, y) objects — otherwise a future schema
++                // change will wipe every resident's local cache (Firestore remains the source
++                // of truth, so data isn't permanently lost, but it forces a full re-sync and
++                // will look like data loss to users on a bad connection).
+                 val instance = Room.databaseBuilder(
+                     context.applicationContext,
+                     AppDatabase::class.java,
+diff --git a/app/src/main/java/com/example/data/db/ComplaintDao.kt b/app/src/main/java/com/example/data/db/ComplaintDao.kt
+index 39b63e0..567f130 100644
+--- a/app/src/main/java/com/example/data/db/ComplaintDao.kt
++++ b/app/src/main/java/com/example/data/db/ComplaintDao.kt
+@@ -15,6 +15,8 @@ interface ComplaintDao {
+     @Insert(onConflict = OnConflictStrategy.REPLACE)
+     suspend fun insertComplaint(complaint: ComplaintEntity): Long
+ 
+-    @Query("UPDATE complaints SET status = :status, adminNoteEn = :noteEn, adminNoteBn = :noteBn, updatedAt = :updatedAt WHERE id = :id")
+-    suspend fun updateComplaintStatus(id: Long, status: String, noteEn: String, noteBn: String, updatedAt: String)
++    // Admin-only status changes are written server-side (Cloud Function) and mirrored
++    // here by the Firestore listener, keyed on the real document ID.
++    @Query("UPDATE complaints SET status = :status, adminNoteEn = :noteEn, adminNoteBn = :noteBn, updatedAt = :updatedAt WHERE firestoreId = :firestoreId")
++    suspend fun updateComplaintStatusByFirestoreId(firestoreId: String, status: String, noteEn: String, noteBn: String, updatedAt: String)
+ }
+diff --git a/app/src/main/java/com/example/data/db/FinancialDao.kt b/app/src/main/java/com/example/data/db/FinancialDao.kt
+index 75a8dcc..da9b435 100644
+--- a/app/src/main/java/com/example/data/db/FinancialDao.kt
++++ b/app/src/main/java/com/example/data/db/FinancialDao.kt
+@@ -15,6 +15,10 @@ interface FinancialDao {
+     @Insert(onConflict = OnConflictStrategy.REPLACE)
+     suspend fun insertFinancialRecord(record: FinancialRecordEntity): Long
+ 
+-    @Query("UPDATE financials SET status = :status, transactionId = :txId, paymentGateway = :gateway WHERE id = :id")
+-    suspend fun updatePaymentStatus(id: Long, status: String, txId: String, gateway: String)
++    // Local cache is READ-ONLY for payment status. The row is written once by the
++    // Firestore listener after the server (Cloud Function, via Admin SDK) confirms
++    // the payment — never directly by client-side "mark as paid" logic. Keyed on
++    // firestoreId, not a hashCode()-derived Long, to avoid collisions.
++    @Query("UPDATE financials SET status = :status, transactionId = :txId, paymentGateway = :gateway WHERE firestoreId = :firestoreId")
++    suspend fun updatePaymentStatusByFirestoreId(firestoreId: String, status: String, txId: String, gateway: String)
+ }
+diff --git a/app/src/main/java/com/example/data/db/UserDao.kt b/app/src/main/java/com/example/data/db/UserDao.kt
+index cc39eab..839bfef 100644
+--- a/app/src/main/java/com/example/data/db/UserDao.kt
++++ b/app/src/main/java/com/example/data/db/UserDao.kt
+@@ -15,6 +15,11 @@ interface UserDao {
+     @Query("SELECT * FROM users WHERE phone = :phone LIMIT 1")
+     suspend fun getUserByPhone(phone: String): UserEntity?
+ 
++    // Exact lookup — this is what login should use to resolve a Firebase-authenticated
++    // session to a resident profile. Replaces the old fuzzy name-substring match.
++    @Query("SELECT * FROM users WHERE firebaseUid = :uid LIMIT 1")
++    suspend fun getUserByFirebaseUid(uid: String): UserEntity?
++
+     @Insert(onConflict = OnConflictStrategy.REPLACE)
+     suspend fun insertUser(user: UserEntity)
+ 
+diff --git a/app/src/main/java/com/example/data/model/AnnouncementEntity.kt b/app/src/main/java/com/example/data/model/AnnouncementEntity.kt
+index 4fbb6d9..a668973 100644
+--- a/app/src/main/java/com/example/data/model/AnnouncementEntity.kt
++++ b/app/src/main/java/com/example/data/model/AnnouncementEntity.kt
+@@ -2,10 +2,16 @@ package com.example.data.model
+ 
+ import androidx.room.Entity
+ import androidx.room.PrimaryKey
++import com.google.firebase.firestore.DocumentId
+ 
+ @Entity(tableName = "announcements")
+ data class AnnouncementEntity(
+     @PrimaryKey(autoGenerate = true) val id: Long = 0,
++    // Real Firestore document ID — see the same note in FinancialRecordEntity on why
++    // this replaces hashCode()-derived IDs (collision risk) for anything that needs
++    // to reference a specific announcement (e.g. deleteAnnouncement).
++    @DocumentId
++    val firestoreId: String = "",
+     val titleEn: String = "",
+     val titleBn: String = "",
+     val descriptionEn: String = "",
+diff --git a/app/src/main/java/com/example/data/model/ComplaintEntity.kt b/app/src/main/java/com/example/data/model/ComplaintEntity.kt
+index 241251d..282ec1d 100644
+--- a/app/src/main/java/com/example/data/model/ComplaintEntity.kt
++++ b/app/src/main/java/com/example/data/model/ComplaintEntity.kt
+@@ -2,10 +2,16 @@ package com.example.data.model
+ 
+ import androidx.room.Entity
+ import androidx.room.PrimaryKey
++import com.google.firebase.firestore.DocumentId
+ 
+ @Entity(tableName = "complaints")
+ data class ComplaintEntity(
+     @PrimaryKey(autoGenerate = true) val id: Long = 0,
++    // Authoritative Firestore document ID — see note in FinancialRecordEntity.
++    // Do not derive numeric IDs from hashCode() for cross-referencing Firestore.
++    // @DocumentId auto-populates this from doc.id on toObject() reads.
++    @DocumentId
++    val firestoreId: String = "",
+     val userId: String = "",
+     val userNameEn: String = "",
+     val userNameBn: String = "",
+diff --git a/app/src/main/java/com/example/data/model/FinancialRecordEntity.kt b/app/src/main/java/com/example/data/model/FinancialRecordEntity.kt
+index 2390506..b0ef681 100644
+--- a/app/src/main/java/com/example/data/model/FinancialRecordEntity.kt
++++ b/app/src/main/java/com/example/data/model/FinancialRecordEntity.kt
+@@ -2,10 +2,20 @@ package com.example.data.model
+ 
+ import androidx.room.Entity
+ import androidx.room.PrimaryKey
++import com.google.firebase.firestore.DocumentId
+ 
+ @Entity(tableName = "financials")
+ data class FinancialRecordEntity(
+     @PrimaryKey(autoGenerate = true) val id: Long = 0,
++    // The authoritative Firestore document ID. Never derive this from hashCode() —
++    // String.hashCode() collapses to 32 bits and WILL collide at scale, silently
++    // merging two different residents' payment records. Always store and use the
++    // real Firestore doc ID string for any cross-reference.
++    // @DocumentId auto-populates this from the document's own ID on toObject() reads
++    // — Firestore doesn't store it as a regular field, so without this annotation
++    // it would silently stay blank on every synced record.
++    @DocumentId
++    val firestoreId: String = "",
+     val userId: String = "",
+     val titleEn: String = "",
+     val titleBn: String = "",
+diff --git a/app/src/main/java/com/example/data/model/UserEntity.kt b/app/src/main/java/com/example/data/model/UserEntity.kt
+index b5fe3c1..e39d25a 100644
+--- a/app/src/main/java/com/example/data/model/UserEntity.kt
++++ b/app/src/main/java/com/example/data/model/UserEntity.kt
+@@ -6,6 +6,10 @@ import androidx.room.PrimaryKey
+ @Entity(tableName = "users")
+ data class UserEntity(
+     @PrimaryKey val id: String = "USR-101",
++    // Exact link to the authenticated Firebase Auth account (auth.currentUser.uid).
++    // This is the ONLY safe way to map a signed-in session to a resident profile —
++    // never match on name substrings or phone/email string comparisons alone.
++    val firebaseUid: String = "",
+     val phone: String = "",
+     val nameEn: String = "",
+     val nameBn: String = "",
+diff --git a/app/src/main/java/com/example/data/repository/ClubRepository.kt b/app/src/main/java/com/example/data/repository/ClubRepository.kt
+index b907b7a..a354a90 100644
+--- a/app/src/main/java/com/example/data/repository/ClubRepository.kt
++++ b/app/src/main/java/com/example/data/repository/ClubRepository.kt
+@@ -36,16 +36,20 @@ class ClubRepository(private val db: AppDatabase) {
+     suspend fun updateUser(user: UserEntity) = userDao.updateUser(user)
+ 
+     suspend fun insertFinancialRecord(record: FinancialRecordEntity) = financialDao.insertFinancialRecord(record)
+-    suspend fun updatePaymentStatus(id: Long, status: String, txId: String, gateway: String) =
+-        financialDao.updatePaymentStatus(id, status, txId, gateway)
++    // Local cache mirror only — the real payment confirmation happens server-side via
++    // executeBkashPayment (Cloud Function), after bKash itself confirms the transaction.
++    suspend fun updatePaymentStatus(firestoreId: String, status: String, txId: String, gateway: String) =
++        financialDao.updatePaymentStatusByFirestoreId(firestoreId, status, txId, gateway)
+ 
+     suspend fun insertAnnouncement(announcement: AnnouncementEntity) = announcementDao.insertAnnouncement(announcement)
+     suspend fun cacheAnnouncements(announcements: List<AnnouncementEntity>) = announcementDao.insertAnnouncements(announcements)
+     suspend fun deleteAnnouncement(id: Long) = announcementDao.deleteAnnouncement(id)
+ 
+     suspend fun insertComplaint(complaint: ComplaintEntity) = complaintDao.insertComplaint(complaint)
+-    suspend fun updateComplaintStatus(id: Long, status: String, noteEn: String, noteBn: String, updatedAt: String) =
+-        complaintDao.updateComplaintStatus(id, status, noteEn, noteBn, updatedAt)
++    // Local cache mirror only — the real update happens server-side via the
++    // updateComplaintStatus Cloud Function; see ComplaintsViewModel.
++    suspend fun updateComplaintStatus(firestoreId: String, status: String, noteEn: String, noteBn: String, updatedAt: String) =
++        complaintDao.updateComplaintStatusByFirestoreId(firestoreId, status, noteEn, noteBn, updatedAt)
+ 
+     suspend fun insertActivity(activity: ActivityEntity) = activityDao.insertActivity(activity)
+ 
+diff --git a/app/src/main/java/com/example/data/repository/FirestoreRepository.kt b/app/src/main/java/com/example/data/repository/FirestoreRepository.kt
+index 454c7e5..f2188bc 100644
+--- a/app/src/main/java/com/example/data/repository/FirestoreRepository.kt
++++ b/app/src/main/java/com/example/data/repository/FirestoreRepository.kt
+@@ -117,34 +117,22 @@ class FirestoreRepository {
+     suspend fun addComplaint(complaint: ComplaintEntity): Result<String> = runCatching {
+         val collection = complaintsCollection ?: throw IllegalStateException("Firestore not initialized")
+         val docRef = collection.document()
+-        val complaintToSave = complaint.copy(
+-            id = docRef.id.hashCode().toLong(),
+-            status = "Pending"
+-        )
++        // No more hashCode()-derived `id` written into the document — firestoreId
++        // (via @DocumentId on ComplaintEntity) is the real, collision-free identifier
++        // now. Writing a hash into `id` here was vestigial and just added a stray,
++        // meaningless field to every complaint document.
++        val complaintToSave = complaint.copy(status = "Pending")
+         docRef.set(complaintToSave).await()
+         docRef.id
+     }
+ 
+-    /**
+-     * Update the status and admin notes for a complaint in Firestore.
+-     */
+-    suspend fun updateComplaintStatus(
+-        complaintId: Long,
+-        status: String,
+-        adminNoteEn: String,
+-        adminNoteBn: String,
+-        updatedAt: String
+-    ): Result<Unit> = runCatching {
+-        val collection = complaintsCollection ?: throw IllegalStateException("Firestore not initialized")
+-        collection.document(complaintId.toString()).update(
+-            mapOf(
+-                "status" to status,
+-                "adminNoteEn" to adminNoteEn,
+-                "adminNoteBn" to adminNoteBn,
+-                "updatedAt" to updatedAt
+-            )
+-        ).await()
+-    }
++    // NOTE: the old updateComplaintStatus() client write was removed here — complaints
++    // status changes are admin-only now and go exclusively through the
++    // updateComplaintStatus Cloud Function (functions/index.js), enforced by
++    // firestore.rules denying direct client writes to this collection. Keeping a
++    // dead client-write method around was a landmine: it compiled fine but would
++    // either silently fail once rules were deployed, or (worse, pre-deployment)
++    // quietly work and reintroduce the original vulnerability.
+ 
+     // --- ANNOUNCEMENTS & NOTICES MANAGEMENT ---
+ 
+@@ -174,8 +162,7 @@ class FirestoreRepository {
+     suspend fun addAnnouncement(announcement: AnnouncementEntity): Result<String> = runCatching {
+         val collection = announcementsCollection ?: throw IllegalStateException("Firestore not initialized")
+         val docRef = collection.document()
+-        val announcementWithId = announcement.copy(id = docRef.id.hashCode().toLong())
+-        docRef.set(announcementWithId).await()
++        docRef.set(announcement).await()
+         docRef.id
+     }
+ 
+@@ -221,23 +208,19 @@ class FirestoreRepository {
+     /**
+      * Update membership status of a user (e.g. "Active", "Pending").
+      */
+-    suspend fun updateMembershipStatus(userId: String, status: String): Result<Unit> = runCatching {
+-        val collection = usersCollection ?: throw IllegalStateException("Firestore not initialized")
+-        collection.document(userId).update("membershipStatus", status).await()
+-    }
++    // NOTE: updateMembershipStatus() client write removed — membership approval is
++    // admin-only and now goes exclusively through the approveMembership Cloud
++    // Function, enforced by firestore.rules denying non-admin writes to
++    // role/membershipStatus on the users collection.
+ 
+     // --- FINANCIAL RECORDS MANAGEMENT ---
+ 
+-    /**
+-     * Save a new financial record (Due, Paid, Donation) to Firestore.
+-     */
+-    suspend fun addFinancialRecord(record: FinancialRecordEntity): Result<String> = runCatching {
+-        val collection = financialsCollection ?: throw IllegalStateException("Firestore not initialized")
+-        val docRef = collection.document()
+-        val recordWithId = record.copy(id = docRef.id.hashCode().toLong())
+-        docRef.set(recordWithId).await()
+-        docRef.id
+-    }
++    // NOTE: addFinancialRecord() client write removed — financials/{} denies ALL
++    // direct client writes now (see firestore.rules). Every path that used to call
++    // this (donations, admin ledger adjustments, payments) has been rewired to the
++    // corresponding Cloud Function: createPendingDonation, recordFinancialAdjustment,
++    // initiatePipraPayCharge/executeBkashPayment. This also removes the last of the
++    // hashCode()-derived-id writes in this file.
+ 
+     /**
+      * Stream user-specific financial records in real-time.
+diff --git a/app/src/main/java/com/example/ui/components/AdminDashboardView.kt b/app/src/main/java/com/example/ui/components/AdminDashboardView.kt
+index c51c2ee..1c5af67 100644
+--- a/app/src/main/java/com/example/ui/components/AdminDashboardView.kt
++++ b/app/src/main/java/com/example/ui/components/AdminDashboardView.kt
+@@ -42,7 +42,7 @@ fun AdminDashboardOverview(
+     val recentFinancials by adminViewModel.recentFinancials.collectAsState()
+     val activityLogs by adminViewModel.activityLogs.collectAsState()
+ 
+-    var resolveComplaintId by remember { mutableStateOf<Long?>(null) }
++    var resolveComplaint by remember { mutableStateOf<com.example.data.model.ComplaintEntity?>(null) }
+     var resolveNote by remember { mutableStateOf("") }
+ 
+     Column(
+@@ -190,8 +190,8 @@ fun AdminDashboardOverview(
+                             PendingComplaintDashboardCard(
+                                 complaint = complaint,
+                                 lang = lang,
+-                                onQuickResolve = { id ->
+-                                    resolveComplaintId = id
++                                onQuickResolve = { c2 ->
++                                    resolveComplaint = c2
+                                 }
+                             )
+                         }
+@@ -315,9 +315,9 @@ fun AdminDashboardOverview(
+     }
+ 
+     // Resolve Complaint Dialog
+-    if (resolveComplaintId != null) {
++    if (resolveComplaint != null) {
+         AlertDialog(
+-            onDismissRequest = { resolveComplaintId = null },
++            onDismissRequest = { resolveComplaint = null },
+             title = { Text(if (lang == Language.BN) "অভিযোগ দ্রুত সমাধান" else "Quick Resolve Complaint") },
+             text = {
+                 Column(verticalArrangement = Arrangement.spacedBy(8.dp)) {
+@@ -334,12 +334,12 @@ fun AdminDashboardOverview(
+                 Button(
+                     onClick = {
+                         adminViewModel.updateComplaintStatus(
+-                            id = resolveComplaintId!!,
++                            complaint = resolveComplaint!!,
+                             status = "Resolved",
+                             adminNoteEn = resolveNote.ifBlank { "Resolved by Admin Committee" },
+                             adminNoteBn = resolveNote.ifBlank { "অ্যাডমিন কমিটি কর্তৃক সমাধান করা হয়েছে" }
+                         )
+-                        resolveComplaintId = null
++                        resolveComplaint = null
+                         resolveNote = ""
+                     },
+                     colors = ButtonDefaults.buttonColors(containerColor = Color(0xFF2E7D32)),
+@@ -349,7 +349,7 @@ fun AdminDashboardOverview(
+                 }
+             },
+             dismissButton = {
+-                TextButton(onClick = { resolveComplaintId = null }) {
++                TextButton(onClick = { resolveComplaint = null }) {
+                     Text("Cancel")
+                 }
+             }
+@@ -436,7 +436,7 @@ fun MetricSummaryCard(
+ fun PendingComplaintDashboardCard(
+     complaint: ComplaintEntity,
+     lang: Language,
+-    onQuickResolve: (Long) -> Unit
++    onQuickResolve: (com.example.data.model.ComplaintEntity) -> Unit
+ ) {
+     Card(
+         modifier = Modifier.fillMaxWidth(),
+@@ -468,7 +468,7 @@ fun PendingComplaintDashboardCard(
+             Spacer(modifier = Modifier.width(8.dp))
+ 
+             Button(
+-                onClick = { onQuickResolve(complaint.id) },
++                onClick = { onQuickResolve(complaint) },
+                 colors = ButtonDefaults.buttonColors(containerColor = Color(0xFF2E7D32)),
+                 modifier = Modifier
+                     .height(32.dp)
+diff --git a/app/src/main/java/com/example/ui/screens/AdminPortalScreen.kt b/app/src/main/java/com/example/ui/screens/AdminPortalScreen.kt
+index 0483571..df05193 100644
+--- a/app/src/main/java/com/example/ui/screens/AdminPortalScreen.kt
++++ b/app/src/main/java/com/example/ui/screens/AdminPortalScreen.kt
+@@ -530,7 +530,7 @@ fun AdminComplaintItem(complaint: ComplaintEntity, viewModel: ClubViewModel, lan
+             },
+             confirmButton = {
+                 Button(onClick = {
+-                    viewModel.updateComplaintStatus(complaint.id, status, note, note)
++                    viewModel.updateComplaintStatus(complaint, status, note, note)
+                     showResolveDialog = false
+                 }) {
+                     Text("Save")
+diff --git a/app/src/main/java/com/example/ui/screens/AuthScreen.kt b/app/src/main/java/com/example/ui/screens/AuthScreen.kt
+index d6a8980..15089ab 100644
+--- a/app/src/main/java/com/example/ui/screens/AuthScreen.kt
++++ b/app/src/main/java/com/example/ui/screens/AuthScreen.kt
+@@ -18,6 +18,7 @@ import androidx.compose.ui.platform.LocalContext
+ import androidx.compose.ui.platform.testTag
+ import androidx.fragment.app.FragmentActivity
+ import android.widget.Toast
++import com.google.firebase.auth.FirebaseAuth
+ import com.example.utils.BiometricAuthManager
+ import androidx.compose.ui.res.painterResource
+ import androidx.compose.ui.text.font.FontWeight
+@@ -44,15 +45,14 @@ fun AuthScreen(
+     var authMethod by remember { mutableStateOf("Email") } // "Email" or "Phone"
+     var isRegisterMode by remember { mutableStateOf(false) }
+ 
+-    var emailText by remember { mutableStateOf("resident@kunjachaya.com") }
+-    var passwordText by remember { mutableStateOf("ClubResident2026!") }
++    var emailText by remember { mutableStateOf("") }
++    var passwordText by remember { mutableStateOf("") }
+     var passwordVisible by remember { mutableStateOf(false) }
+-    var fullNameText by remember { mutableStateOf("Anisur Rahman") }
++    var fullNameText by remember { mutableStateOf("") }
+     
+-    var phoneNumber by remember { mutableStateOf("+8801712345678") }
++    var phoneNumber by remember { mutableStateOf("") }
+     var otpCode by remember { mutableStateOf("") }
+     var otpSent by remember { mutableStateOf(false) }
+-    var selectedRole by remember { mutableStateOf("Member") }
+     var errorMessage by remember { mutableStateOf("") }
+     var isAuthLoading by remember { mutableStateOf(false) }
+ 
+@@ -60,6 +60,20 @@ fun AuthScreen(
+     var biometricStatusMessage by remember { mutableStateOf("") }
+ 
+     fun triggerBiometricAuth() {
++        // Biometric is only a LOCAL re-auth gate for a device that already has a real,
++        // persisted Firebase Auth session on it — never a way to pick "some account of
++        // the currently selected role." If nobody has completed an actual email/password
++        // (or phone) login on this device yet, there's nothing for a fingerprint to unlock.
++        val persistedFirebaseUser = FirebaseAuth.getInstance().currentUser
++        if (persistedFirebaseUser == null) {
++            errorMessage = if (lang == Language.BN)
++                "প্রথমে ইমেইল/পাসওয়ার্ড দিয়ে লগইন করুন। এরপর বায়োমেট্রিক দ্রুত-লগইন ব্যবহার করা যাবে।"
++            else
++                "Please sign in with email/password first. Biometric quick-login becomes available after that."
++            showBiometricModal = true
++            return
++        }
++
+         val fragmentActivity = context as? FragmentActivity
+         val status = BiometricAuthManager.checkBiometricStatus(context)
+         if (fragmentActivity != null && status == BiometricAuthManager.BiometricStatus.AVAILABLE) {
+@@ -69,14 +83,25 @@ fun AuthScreen(
+                 subtitle = if (lang == Language.BN) "আঙ্গুলের ছাপ বা ফেস রিকগনিশন দিয়ে সহজে লগইন করুন" else "Log in using fingerprint or face recognition",
+                 negativeButtonText = if (lang == Language.BN) "পাসওয়ার্ড ব্যবহার করুন" else "Use Password / PIN",
+                 onSuccess = {
+-                    val targetUser = allUsers.firstOrNull { it.role == selectedRole } ?: allUsers.firstOrNull()
+-                    if (targetUser != null) viewModel.selectUser(targetUser)
+-                    Toast.makeText(
+-                        context,
+-                        if (lang == Language.BN) "বায়োমেট্রিক যাচাইকরণ সফল!" else "Biometric verification successful!",
+-                        Toast.LENGTH_SHORT
+-                    ).show()
+-                    onLoginSuccess()
++                    // Resolve the EXACT resident profile tied to this device's persisted
++                    // Firebase UID — the fingerprint only confirms "device owner present,"
++                    // it never chooses which account to log into.
++                    val targetUser = allUsers.firstOrNull { it.firebaseUid == persistedFirebaseUser.uid }
++                    if (targetUser != null) {
++                        viewModel.selectUser(targetUser)
++                        Toast.makeText(
++                            context,
++                            if (lang == Language.BN) "বায়োমেট্রিক যাচাইকরণ সফল!" else "Biometric verification successful!",
++                            Toast.LENGTH_SHORT
++                        ).show()
++                        onLoginSuccess()
++                    } else {
++                        biometricStatusMessage = if (lang == Language.BN)
++                            "এই অ্যাকাউন্টের জন্য কোনো প্রোফাইল পাওয়া যায়নি।"
++                        else
++                            "No resident profile found for this account."
++                        showBiometricModal = true
++                    }
+                 },
+                 onError = { _, errStr ->
+                     biometricStatusMessage = errStr.toString()
+@@ -202,36 +227,30 @@ fun AuthScreen(
+ 
+                     Spacer(modifier = Modifier.height(14.dp))
+ 
+-                    // Role Toggle
+-                    Row(
+-                        modifier = Modifier.fillMaxWidth(),
+-                        horizontalArrangement = Arrangement.spacedBy(8.dp)
+-                    ) {
+-                        OutlinedButton(
+-                            onClick = { selectedRole = "Member" },
+-                            modifier = Modifier.weight(1f).testTag("role_member_btn"),
+-                            colors = if (selectedRole == "Member") ButtonDefaults.outlinedButtonColors(
+-                                containerColor = MaterialTheme.colorScheme.primaryContainer,
+-                                contentColor = MaterialTheme.colorScheme.primary
+-                            ) else ButtonDefaults.outlinedButtonColors()
+-                        ) {
+-                            Icon(Icons.Default.Person, contentDescription = null, modifier = Modifier.size(18.dp))
+-                            Spacer(modifier = Modifier.width(6.dp))
+-                            Text(AppLanguage.roleMember(lang), fontSize = 13.sp)
+-                        }
+-
+-                        OutlinedButton(
+-                            onClick = { selectedRole = "Admin" },
+-                            modifier = Modifier.weight(1f).testTag("role_admin_btn"),
+-                            colors = if (selectedRole == "Admin") ButtonDefaults.outlinedButtonColors(
+-                                containerColor = MaterialTheme.colorScheme.secondaryContainer,
+-                                contentColor = MaterialTheme.colorScheme.secondary
+-                            ) else ButtonDefaults.outlinedButtonColors()
++                    if (isRegisterMode) {
++                        // No role selector here anymore: every self-registration is created
++                        // as "Member" / "Pending" by the server (see registerResident in
++                        // functions/index.js). Becoming Admin is a separate, admin-only action
++                        // taken after registration — never something the person signing up
++                        // picks for themselves.
++                        Surface(
++                            color = MaterialTheme.colorScheme.surfaceVariant,
++                            shape = RoundedCornerShape(8.dp),
++                            modifier = Modifier.fillMaxWidth().padding(bottom = 4.dp)
+                         ) {
+-                            Icon(Icons.Default.AdminPanelSettings, contentDescription = null, modifier = Modifier.size(18.dp))
+-                            Spacer(modifier = Modifier.width(6.dp))
+-                            Text(AppLanguage.roleAdmin(lang), fontSize = 13.sp)
++                            Row(modifier = Modifier.padding(10.dp), verticalAlignment = Alignment.CenterVertically) {
++                                Icon(Icons.Default.Info, contentDescription = null, modifier = Modifier.size(16.dp))
++                                Spacer(modifier = Modifier.width(8.dp))
++                                Text(
++                                    if (lang == Language.BN)
++                                        "নতুন অ্যাকাউন্ট সদস্য হিসেবে তৈরি হবে এবং কমিটির অনুমোদনের অপেক্ষায় থাকবে।"
++                                    else
++                                        "New accounts are created as Member and await committee approval.",
++                                    fontSize = 11.sp
++                                )
++                            }
+                         }
++                        Spacer(modifier = Modifier.height(10.dp))
+                     }
+ 
+                     Spacer(modifier = Modifier.height(14.dp))
+@@ -313,7 +332,6 @@ fun AuthScreen(
+                                         pass = passwordText,
+                                         name = fullNameText.ifBlank { "Resident" },
+                                         phone = phoneNumber,
+-                                        selectedRole = selectedRole,
+                                         onResult = { success, error ->
+                                             isAuthLoading = false
+                                             if (success) {
+@@ -328,7 +346,6 @@ fun AuthScreen(
+                                     viewModel.loginWithEmail(
+                                         email = emailText.trim(),
+                                         pass = passwordText,
+-                                        selectedRole = selectedRole,
+                                         onResult = { success, error ->
+                                             isAuthLoading = false
+                                             if (success) {
+@@ -433,7 +450,7 @@ fun AuthScreen(
+ 
+                             Button(
+                                 onClick = {
+-                                    viewModel.loginWithPhone(phoneNumber, selectedRole)
++                                    viewModel.loginWithPhone(phoneNumber)
+                                     onLoginSuccess()
+                                 },
+                                 modifier = Modifier.fillMaxWidth().height(48.dp).testTag("verify_login_btn")
+@@ -540,15 +557,25 @@ fun AuthScreen(
+                 statusMessage = biometricStatusMessage,
+                 onDismiss = { showBiometricModal = false },
+                 onAuthenticateSuccess = {
+-                    val targetUser = allUsers.firstOrNull { it.role == selectedRole } ?: allUsers.firstOrNull()
+-                    if (targetUser != null) viewModel.selectUser(targetUser)
+-                    showBiometricModal = false
+-                    Toast.makeText(
+-                        context,
+-                        if (lang == Language.BN) "বায়োমেট্রিক লগইন সফল হয়েছে!" else "Biometric login successful!",
+-                        Toast.LENGTH_SHORT
+-                    ).show()
+-                    onLoginSuccess()
++                    val persistedFirebaseUser = FirebaseAuth.getInstance().currentUser
++                    val targetUser = persistedFirebaseUser?.let { fbUser ->
++                        allUsers.firstOrNull { it.firebaseUid == fbUser.uid }
++                    }
++                    if (targetUser != null) {
++                        viewModel.selectUser(targetUser)
++                        showBiometricModal = false
++                        Toast.makeText(
++                            context,
++                            if (lang == Language.BN) "বায়োমেট্রিক লগইন সফল হয়েছে!" else "Biometric login successful!",
++                            Toast.LENGTH_SHORT
++                        ).show()
++                        onLoginSuccess()
++                    } else {
++                        biometricStatusMessage = if (lang == Language.BN)
++                            "প্রথমে ইমেইল/পাসওয়ার্ড দিয়ে লগইন করুন।"
++                        else
++                            "Please sign in with email/password first."
++                    }
+                 }
+             )
+         }
+diff --git a/app/src/main/java/com/example/ui/screens/FinancialsScreen.kt b/app/src/main/java/com/example/ui/screens/FinancialsScreen.kt
+index 4d8d608..5990d3b 100644
+--- a/app/src/main/java/com/example/ui/screens/FinancialsScreen.kt
++++ b/app/src/main/java/com/example/ui/screens/FinancialsScreen.kt
+@@ -30,6 +30,7 @@ import androidx.compose.ui.text.style.TextAlign
+ import androidx.compose.ui.text.style.TextOverflow
+ import androidx.compose.ui.unit.dp
+ import androidx.compose.ui.unit.sp
++import androidx.browser.customtabs.CustomTabsIntent
+ import com.example.R
+ import com.example.data.model.FinancialRecordEntity
+ import com.example.ui.components.VisualSpendingDashboard
+@@ -534,13 +535,11 @@ fun FinancialsScreen(
+         }
+     }
+ 
+-    // Payment Gateway Checkout Dialog with Live Step Tracker Simulation
++    // Real PipraPay Checkout Dialog
+     if (showPayDialog != null) {
+         val record = showPayDialog!!
+-        var selectedGateway by remember { mutableStateOf("bKash") }
+-        var mobileNumber by remember { mutableStateOf(user?.primaryContact ?: "01712345678") }
+         var isProcessing by remember { mutableStateOf(false) }
+-        var currentProcessStage by remember { mutableStateOf(0) } // 0: Idle, 1: Validating, 2: Gateway Check, 3: Firestore Write, 4: Done
++        var currentProcessStage by remember { mutableStateOf(0) } // 0: Idle, 1: Creating session, 2: Opening checkout
+ 
+         AlertDialog(
+             onDismissRequest = { if (!isProcessing) showPayDialog = null },
+@@ -581,33 +580,21 @@ fun FinancialsScreen(
+                         }
+                     }
+ 
++                    // No gateway/wallet-number picker here anymore: PipraPay's own hosted
++                    // checkout page is where the resident actually chooses bKash / Nagad /
++                    // Rocket / Card and enters their wallet number — collecting it here too
++                    // was UI theater since none of it was ever sent anywhere.
+                     Text(
+-                        text = if (lang == Language.BN) "পেমেন্ট মাধ্যম নির্বাচন করুন:" else "Select Payment Gateway:",
++                        text = if (lang == Language.BN)
++                            "পরবর্তী পেজে আপনি bKash, Nagad, Rocket বা কার্ড থেকে বেছে নিতে পারবেন।"
++                        else
++                            "You'll choose bKash, Nagad, Rocket, or Card on the next secure page.",
+                         fontSize = 12.sp,
+-                        fontWeight = FontWeight.Bold
++                        color = MaterialTheme.colorScheme.onSurfaceVariant
+                     )
+ 
+-                    Row(
+-                        modifier = Modifier.fillMaxWidth(),
+-                        horizontalArrangement = Arrangement.spacedBy(6.dp)
+-                    ) {
+-                        GatewayChip(name = "bKash", selected = selectedGateway == "bKash", color = Color(0xFFE2136E)) { if (!isProcessing) selectedGateway = "bKash" }
+-                        GatewayChip(name = "Nagad", selected = selectedGateway == "Nagad", color = Color(0xFFF7941D)) { if (!isProcessing) selectedGateway = "Nagad" }
+-                        GatewayChip(name = "Rocket", selected = selectedGateway == "Rocket", color = Color(0xFF8C3494)) { if (!isProcessing) selectedGateway = "Rocket" }
+-                        GatewayChip(name = "Card/Bank", selected = selectedGateway == "Card", color = Color(0xFF1A1F71)) { if (!isProcessing) selectedGateway = "Card" }
+-                    }
+-
+-                    OutlinedTextField(
+-                        value = mobileNumber,
+-                        onValueChange = { mobileNumber = it },
+-                        label = { Text(if (lang == Language.BN) "ওয়ালেট / অ্যাকাউন্টের নম্বর" else "Wallet / Account Phone Number") },
+-                        enabled = !isProcessing,
+-                        keyboardOptions = KeyboardOptions(keyboardType = KeyboardType.Phone),
+-                        singleLine = true,
+-                        modifier = Modifier.fillMaxWidth().testTag("payment_account_phone_input")
+-                    )
+-
+-                    // Real-Time Progress Tracker Stepper during submission
++                    // Real-Time Progress during submission (only two honest stages: we
++                    // don't claim to know what happens inside PipraPay's own checkout)
+                     if (isProcessing) {
+                         Spacer(modifier = Modifier.height(4.dp))
+                         Surface(
+@@ -617,7 +604,7 @@ fun FinancialsScreen(
+                         ) {
+                             Column(modifier = Modifier.padding(12.dp), verticalArrangement = Arrangement.spacedBy(6.dp)) {
+                                 Text(
+-                                    text = if (lang == Language.BN) "পেমেন্ট স্ট্যাটাস ট্র্যাকার (রিয়েল-টাইম)" else "Payment Status Tracker (Real-Time)",
++                                    text = if (lang == Language.BN) "পেমেন্ট সেশন প্রস্তুত করা হচ্ছে" else "Preparing Payment Session",
+                                     fontSize = 11.sp,
+                                     fontWeight = FontWeight.Bold,
+                                     color = MaterialTheme.colorScheme.primary
+@@ -625,28 +612,16 @@ fun FinancialsScreen(
+ 
+                                 TrackerStepItem(
+                                     stepNum = 1,
+-                                    title = if (lang == Language.BN) "১. তথ্য যাচাইকরণ ও এনক্রিপশন" else "1. Payload Validation & TLS Security",
++                                    title = if (lang == Language.BN) "১. পেমেন্ট সেশন তৈরি হচ্ছে" else "1. Creating secure checkout session",
+                                     isDone = currentProcessStage >= 1,
+                                     isCurrent = currentProcessStage == 1
+                                 )
+                                 TrackerStepItem(
+                                     stepNum = 2,
+-                                    title = if (lang == Language.BN) "২. $selectedGateway গেটওয়ে অনুমোদন" else "2. $selectedGateway Gateway Handshake",
++                                    title = if (lang == Language.BN) "২. চেকআউট পেজ খোলা হচ্ছে" else "2. Opening PipraPay checkout page",
+                                     isDone = currentProcessStage >= 2,
+                                     isCurrent = currentProcessStage == 2
+                                 )
+-                                TrackerStepItem(
+-                                    stepNum = 3,
+-                                    title = if (lang == Language.BN) "৩. ফায়ারস্টোর লেজার সিঙ্ক" else "3. Firestore Database Synchronization",
+-                                    isDone = currentProcessStage >= 3,
+-                                    isCurrent = currentProcessStage == 3
+-                                )
+-                                TrackerStepItem(
+-                                    stepNum = 4,
+-                                    title = if (lang == Language.BN) "৪. ডিজিটাল রসিদ ইস্যু সম্পন্ন" else "4. Electronic Receipt Issuance",
+-                                    isDone = currentProcessStage >= 4,
+-                                    isCurrent = currentProcessStage == 4
+-                                )
+                             }
+                         }
+                     }
+@@ -655,34 +630,59 @@ fun FinancialsScreen(
+             confirmButton = {
+                 Button(
+                     onClick = {
+-                        if (mobileNumber.isBlank()) {
+-                            Toast.makeText(context, "Please enter a valid wallet number", Toast.LENGTH_SHORT).show()
++                        if (record.firestoreId.isBlank()) {
++                            Toast.makeText(context, "This record hasn't synced with the server yet — try again shortly.", Toast.LENGTH_LONG).show()
+                             return@Button
+                         }
+                         isProcessing = true
+-                        scope.launch {
+-                            currentProcessStage = 1
+-                            delay(600)
+-                            currentProcessStage = 2
+-                            delay(700)
+-                            currentProcessStage = 3
++                        currentProcessStage = 1 // creating the checkout session server-side
+ 
+-                            viewModel.markDueAsPaid(record, selectedGateway) { txId ->
+-                                scope.launch {
+-                                    currentProcessStage = 4
+-                                    delay(500)
+-                                    isProcessing = false
+-                                    showPayDialog = null
+-                                    val completedRecord = record.copy(
+-                                        status = "Completed",
+-                                        transactionId = txId,
+-                                        paymentGateway = selectedGateway
+-                                    )
+-                                    selectedReceipt = completedRecord
+-                                    trackerRecord = completedRecord
+-                                    Toast.makeText(context, "Payment Completed & Synced with Firestore!", Toast.LENGTH_LONG).show()
+-                                }
++                        // redirectUrl/cancelUrl point back into this app via a custom scheme,
++                        // caught by the <intent-filter> added to AndroidManifest.xml (see
++                        // functions/README.md). The webhook path is still the primary/reliable
++                        // confirmation route — the redirect is just a fallback + UX nicety.
++                        val redirectUrl = "kunjachayaclub://payment-redirect"
++                        val cancelUrl = "kunjachayaclub://payment-cancel"
++
++                        viewModel.initiatePipraPayCheckout(
++                            financialRecordFirestoreId = record.firestoreId,
++                            redirectUrl = redirectUrl,
++                            cancelUrl = cancelUrl
++                        ) { checkoutUrl, _, error ->
++                            if (checkoutUrl.isNullOrBlank()) {
++                                isProcessing = false
++                                currentProcessStage = 0
++                                Toast.makeText(
++                                    context,
++                                    error ?: "Could not start checkout. Please try again.",
++                                    Toast.LENGTH_LONG
++                                ).show()
++                                return@initiatePipraPayCheckout
+                             }
++
++                            currentProcessStage = 2 // opening the real PipraPay checkout page
++                            try {
++                                CustomTabsIntent.Builder().build().launchUrl(context, android.net.Uri.parse(checkoutUrl))
++                            } catch (e: Exception) {
++                                Toast.makeText(context, "Could not open checkout page: ${e.localizedMessage}", Toast.LENGTH_LONG).show()
++                            }
++
++                            // We do NOT mark this Completed here. The resident finishes payment
++                            // in the browser/PipraPay UI; PipraPay's webhook (server-to-server,
++                            // functions/index.js: piprapayWebhook) confirms it independently and
++                            // updates Firestore, which flows back into this screen through the
++                            // existing Firestore listener. Close this dialog and let that happen.
++                            isProcessing = false
++                            currentProcessStage = 0
++                            showPayDialog = null
++                            Toast.makeText(
++                                context,
++                                if (lang == Language.BN)
++                                    "চেকআউট পেজ খোলা হয়েছে। পরিশোধ সম্পন্ন হলে স্ট্যাটাস স্বয়ংক্রিয়ভাবে আপডেট হবে।"
++                                else
++                                    "Checkout opened. Your status will update automatically once PipraPay confirms the payment.",
++                                Toast.LENGTH_LONG
++                            ).show()
+                         }
+                     },
+                     enabled = !isProcessing,
+@@ -713,7 +713,6 @@ fun FinancialsScreen(
+     if (showDonationDialog && user != null) {
+         var donationAmount by remember { mutableStateOf("1000") }
+         var purpose by remember { mutableStateOf("Club Mosque & Library Renovation") }
+-        var selectedGateway by remember { mutableStateOf("bKash") }
+         var isSubmittingDonation by remember { mutableStateOf(false) }
+ 
+         AlertDialog(
+@@ -751,14 +750,16 @@ fun FinancialsScreen(
+                         }
+                     }
+ 
+-                    Row(
+-                        modifier = Modifier.fillMaxWidth(),
+-                        horizontalArrangement = Arrangement.spacedBy(6.dp)
+-                    ) {
+-                        GatewayChip(name = "bKash", selected = selectedGateway == "bKash", color = Color(0xFFE2136E)) { selectedGateway = "bKash" }
+-                        GatewayChip(name = "Nagad", selected = selectedGateway == "Nagad", color = Color(0xFFF7941D)) { selectedGateway = "Nagad" }
+-                        GatewayChip(name = "Rocket", selected = selectedGateway == "Rocket", color = Color(0xFF8C3494)) { selectedGateway = "Rocket" }
+-                    }
++                    // Gateway/method choice happens on PipraPay's own hosted checkout page
++                    // next, not here — see note in the main payment dialog above.
++                    Text(
++                        text = if (lang == Language.BN)
++                            "পরবর্তী পেজে আপনি bKash, Nagad, Rocket বা কার্ড থেকে বেছে নিতে পারবেন।"
++                        else
++                            "You'll choose bKash, Nagad, Rocket, or Card on the next secure page.",
++                        fontSize = 11.sp,
++                        color = MaterialTheme.colorScheme.onSurfaceVariant
++                    )
+                 }
+             },
+             confirmButton = {
+@@ -767,16 +768,33 @@ fun FinancialsScreen(
+                         val amt = donationAmount.toDoubleOrNull() ?: 1000.0
+                         isSubmittingDonation = true
+                         viewModel.processPayment(
+-                            userId = user!!.id,
+-                            amount = amt,
+                             titleEn = purpose,
+                             titleBn = purpose,
+-                            gateway = selectedGateway,
+-                            type = "Donation"
+-                        ) { txId ->
+-                            isSubmittingDonation = false
+-                            showDonationDialog = false
+-                            Toast.makeText(context, "Donation recorded & synced with Firestore!", Toast.LENGTH_SHORT).show()
++                            amount = amt,
++                            purpose = purpose
++                        ) { financialRecordId, error ->
++                            if (financialRecordId == null) {
++                                isSubmittingDonation = false
++                                Toast.makeText(context, error ?: "Could not start donation.", Toast.LENGTH_LONG).show()
++                                return@processPayment
++                            }
++                            viewModel.initiatePipraPayCheckout(
++                                financialRecordFirestoreId = financialRecordId,
++                                redirectUrl = "kunjachayaclub://payment-redirect",
++                                cancelUrl = "kunjachayaclub://payment-cancel"
++                            ) { checkoutUrl, _, checkoutError ->
++                                isSubmittingDonation = false
++                                showDonationDialog = false
++                                if (checkoutUrl != null) {
++                                    try {
++                                        CustomTabsIntent.Builder().build().launchUrl(context, android.net.Uri.parse(checkoutUrl))
++                                    } catch (e: Exception) {
++                                        Toast.makeText(context, "Could not open checkout: ${e.localizedMessage}", Toast.LENGTH_LONG).show()
++                                    }
++                                } else {
++                                    Toast.makeText(context, checkoutError ?: "Could not open checkout.", Toast.LENGTH_LONG).show()
++                                }
++                            }
+                         }
+                     },
+                     enabled = !isSubmittingDonation,
+diff --git a/app/src/main/java/com/example/ui/viewmodel/AdminDashboardViewModel.kt b/app/src/main/java/com/example/ui/viewmodel/AdminDashboardViewModel.kt
+index 06df062..a05316e 100644
+--- a/app/src/main/java/com/example/ui/viewmodel/AdminDashboardViewModel.kt
++++ b/app/src/main/java/com/example/ui/viewmodel/AdminDashboardViewModel.kt
+@@ -9,6 +9,7 @@ import com.example.data.model.ComplaintEntity
+ import com.example.data.model.FinancialRecordEntity
+ import com.example.data.repository.ClubRepository
+ import com.example.data.repository.FirestoreRepository
++import com.example.data.repository.FunctionsRepository
+ import kotlinx.coroutines.flow.*
+ import kotlinx.coroutines.launch
+ 
+@@ -26,6 +27,7 @@ data class AdminDashboardMetrics(
+ class AdminDashboardViewModel(application: Application) : AndroidViewModel(application) {
+     private val clubRepository = ClubRepository(AppDatabase.getDatabase(application))
+     private val firestoreRepository = FirestoreRepository()
++    private val functionsRepository = FunctionsRepository()
+ 
+     // 1. Activity Logs stream from Firestore with Room fallback
+     val activityLogs: StateFlow<List<ActivityLogEntity>> = combine(
+@@ -79,22 +81,27 @@ class AdminDashboardViewModel(application: Application) : AndroidViewModel(appli
+         )
+     }.stateIn(viewModelScope, SharingStarted.WhileSubscribed(5000), AdminDashboardMetrics())
+ 
+-    fun updateComplaintStatus(id: Long, status: String, adminNoteEn: String, adminNoteBn: String) {
++    fun updateComplaintStatus(complaint: ComplaintEntity, status: String, adminNoteEn: String, adminNoteBn: String) {
+         viewModelScope.launch {
++            if (complaint.firestoreId.isBlank()) return@launch
+             val now = "2026-07-25 16:10"
+-            clubRepository.updateComplaintStatus(id, status, adminNoteEn, adminNoteBn, now)
++
++            val outcome = functionsRepository.updateComplaintStatus(complaint.firestoreId, status, adminNoteEn, adminNoteBn)
++            if (outcome is FunctionsRepository.Outcome.Failure) return@launch
++
++            clubRepository.updateComplaintStatus(complaint.firestoreId, status, adminNoteEn, adminNoteBn, now)
+ 
+             val log = ActivityLogEntity(
+                 id = "LOG-${System.currentTimeMillis()}",
+                 actionType = "COMPLAINT_UPDATE",
+                 adminId = "ADM-001",
+                 adminName = "Maintenance Admin",
+-                titleEn = "Updated Complaint #$id to $status",
+-                titleBn = "অভিযোগ #$id এর স্ট্যাটাস $status করা হয়েছে",
++                titleEn = "Updated Complaint #${complaint.id} to $status",
++                titleBn = "অভিযোগ #${complaint.id} এর স্ট্যাটাস $status করা হয়েছে",
+                 detailsEn = "Admin Remark: ${if (adminNoteEn.isBlank()) "Status set to $status" else adminNoteEn}",
+                 detailsBn = "অ্যাডমিন নোট: ${if (adminNoteBn.isBlank()) "স্ট্যাটাস পরিবর্তন: $status" else adminNoteBn}",
+                 timestamp = now,
+-                targetId = id.toString()
++                targetId = complaint.id.toString()
+             )
+             clubRepository.insertActivityLog(log)
+             firestoreRepository.addActivityLog(log)
+diff --git a/app/src/main/java/com/example/ui/viewmodel/ClubViewModel.kt b/app/src/main/java/com/example/ui/viewmodel/ClubViewModel.kt
+index cc80ae0..41938cc 100644
+--- a/app/src/main/java/com/example/ui/viewmodel/ClubViewModel.kt
++++ b/app/src/main/java/com/example/ui/viewmodel/ClubViewModel.kt
+@@ -7,6 +7,7 @@ import com.example.data.db.AppDatabase
+ import com.example.data.model.*
+ import com.example.data.repository.ClubRepository
+ import com.example.data.repository.FirestoreRepository
++import com.example.data.repository.FunctionsRepository
+ import com.example.ui.language.Language
+ import com.google.firebase.auth.FirebaseAuth
+ import com.google.firebase.auth.UserProfileChangeRequest
+@@ -17,6 +18,10 @@ import kotlinx.coroutines.tasks.await
+ class ClubViewModel(application: Application) : AndroidViewModel(application) {
+     private val repository = ClubRepository(AppDatabase.getDatabase(application))
+     private val firestoreRepository = FirestoreRepository()
++    // Everything that used to be a direct, client-trusted Firestore write (roles,
++    // payment status, complaint resolution) now goes through here instead — see
++    // FunctionsRepository + functions/index.js for the server-side enforcement.
++    private val functionsRepository = FunctionsRepository()
+ 
+     val language = MutableStateFlow(Language.BN)
+     val isDarkTheme = MutableStateFlow(false)
+@@ -111,13 +116,18 @@ class ClubViewModel(application: Application) : AndroidViewModel(application) {
+         currentUser.value = user
+     }
+ 
+-    fun loginWithPhone(phone: String, selectedRole: String) {
++    /**
++     * Phone/OTP login. Role is NEVER taken from the client: an existing account keeps
++     * whatever role Firestore/the Admin already assigned it, and any brand-new account
++     * is always created as "Member" / "Pending" — the only way to become Admin is the
++     * server-side setUserRole path (see functions/index.js), gated on an existing admin.
++     */
++    fun loginWithPhone(phone: String) {
+         viewModelScope.launch {
+             val existing = repository.getUserByPhone(phone)
+             if (existing != null) {
+-                currentUser.value = existing.copy(role = selectedRole)
++                currentUser.value = existing
+             } else {
+-                // Create new user with phone
+                 val newId = "USR-${System.currentTimeMillis().toString().takeLast(4)}"
+                 val newUser = UserEntity(
+                     id = newId,
+@@ -139,8 +149,8 @@ class ClubViewModel(application: Application) : AndroidViewModel(application) {
+                     motherNameEn = "Mother Name",
+                     motherNameBn = "মাতার নাম",
+                     familyMembersCount = 3,
+-                    membershipStatus = "Pending",
+-                    role = selectedRole,
++                    membershipStatus = "Pending", // requires admin approval — see approveUserMembership
++                    role = "Member",
+                     profilePicUrl = "",
+                     nidFrontUrl = "NID-$newId",
+                     nidBackUrl = "NID-BACK-$newId",
+@@ -152,10 +162,16 @@ class ClubViewModel(application: Application) : AndroidViewModel(application) {
+         }
+     }
+ 
++    /**
++     * Email/password login. The resident profile is resolved by an EXACT match on
++     * Firebase UID (`firebaseUid`) — never by comparing names/emails as substrings,
++     * which could silently attach a stranger's address/NID/phone to the wrong login.
++     * Role/membershipStatus always come from whatever's already stored for that UID;
++     * this function never sets or overrides them.
++     */
+     fun loginWithEmail(
+         email: String,
+         pass: String,
+-        selectedRole: String,
+         onResult: (Boolean, String?) -> Unit
+     ) {
+         viewModelScope.launch {
+@@ -165,51 +181,19 @@ class ClubViewModel(application: Application) : AndroidViewModel(application) {
+                     .await()
+                 val firebaseUser = authResult.user
+                 if (firebaseUser != null) {
+-                    val uid = firebaseUser.uid
+-                    val userEmail = firebaseUser.email ?: email
+-                    val existingUser = allUsers.value.firstOrNull { 
+-                        it.phone.equals(email, ignoreCase = true) || 
+-                        it.primaryContact.equals(email, ignoreCase = true) ||
+-                        it.nameEn.contains(userEmail.substringBefore("@"), ignoreCase = true)
+-                    }
+-                    val userToSet = if (existingUser == null) {
+-                        val newId = "USR-${uid.takeLast(6)}"
+-                        val displayName = firebaseUser.displayName ?: userEmail.substringBefore("@")
+-                        val newUser = UserEntity(
+-                            id = newId,
+-                            phone = userEmail,
+-                            nameEn = displayName,
+-                            nameBn = displayName,
+-                            dob = "1990-01-01",
+-                            bloodGroup = "B+",
+-                            professionEn = "Resident Member",
+-                            professionBn = "আবাসিক নিবাসী",
+-                            road = "Road 02",
+-                            block = "Block B",
+-                            floor = "3rd Floor",
+-                            holding = "Flat 4A",
+-                            primaryContact = userEmail,
+-                            emergencyContact = "+8801700000000",
+-                            fatherOrSpouseNameEn = "Resident Guardian",
+-                            fatherOrSpouseNameBn = "অভিভাবক",
+-                            motherNameEn = "Resident Mother",
+-                            motherNameBn = "মাতা",
+-                            familyMembersCount = 3,
+-                            membershipStatus = "Active",
+-                            role = selectedRole,
+-                            profilePicUrl = "",
+-                            nidFrontUrl = "NID-$newId",
+-                            nidBackUrl = "NID-BACK-$newId",
+-                            joinedDate = "2026-07-26"
+-                        )
+-                        repository.insertUser(newUser)
+-                        firestoreRepository.saveUser(newUser)
+-                        newUser
++                    val existingUser = repository.getUserByFirebaseUid(firebaseUser.uid)
++                        ?: allUsers.value.firstOrNull { it.firebaseUid == firebaseUser.uid }
++
++                    if (existingUser != null) {
++                        currentUser.value = existingUser
++                        onResult(true, null)
+                     } else {
+-                        existingUser.copy(role = selectedRole)
++                        // Signed in with Firebase Auth but no resident profile exists yet —
++                        // this account needs to go through registerResident (server-side,
++                        // always creates "Member" / "Pending") rather than being silently
++                        // synthesized here with a client-chosen role.
++                        onResult(false, "No resident profile found for this account. Please complete registration.")
+                     }
+-                    currentUser.value = userToSet
+-                    onResult(true, null)
+                 } else {
+                     onResult(false, "Authentication returned empty user profile")
+                 }
+@@ -219,12 +203,18 @@ class ClubViewModel(application: Application) : AndroidViewModel(application) {
+         }
+     }
+ 
++    /**
++     * Registration is two steps: (1) create the Firebase Auth account client-side as
++     * before, then (2) call the registerResident Cloud Function to create the resident
++     * profile — that function hardcodes role="Member" and membershipStatus="Pending"
++     * server-side. There is no `selectedRole` parameter here anymore: it doesn't exist
++     * client-side because it was the entire vulnerability (see functions/index.js).
++     */
+     fun registerWithEmail(
+         email: String,
+         pass: String,
+         name: String,
+         phone: String,
+-        selectedRole: String,
+         onResult: (Boolean, String?) -> Unit
+     ) {
+         viewModelScope.launch {
+@@ -239,38 +229,22 @@ class ClubViewModel(application: Application) : AndroidViewModel(application) {
+                         .build()
+                     firebaseUser.updateProfile(profileChange).await()
+ 
+-                    val newId = "USR-${firebaseUser.uid.takeLast(6)}"
+-                    val newUser = UserEntity(
+-                        id = newId,
+-                        phone = if (phone.isNotBlank()) phone else email,
++                    when (val outcome = functionsRepository.registerResident(
+                         nameEn = name,
+-                        nameBn = name,
+-                        dob = "1992-05-15",
+-                        bloodGroup = "O+",
+-                        professionEn = "Club Resident",
+-                        professionBn = "ক্লাব নিবাসী",
+-                        road = "Road 01",
+-                        block = "Block A",
+-                        floor = "2nd Floor",
+-                        holding = "Apt 2B",
+-                        primaryContact = if (phone.isNotBlank()) phone else email,
+-                        emergencyContact = phone,
+-                        fatherOrSpouseNameEn = "Resident Guardian",
+-                        fatherOrSpouseNameBn = "অভিভাবক",
+-                        motherNameEn = "Resident Mother",
+-                        motherNameBn = "মাতা",
+-                        familyMembersCount = 2,
+-                        membershipStatus = "Active",
+-                        role = selectedRole,
+-                        profilePicUrl = "",
+-                        nidFrontUrl = "NID-$newId",
+-                        nidBackUrl = "NID-BACK-$newId",
+-                        joinedDate = "2026-07-26"
+-                    )
+-                    repository.insertUser(newUser)
+-                    firestoreRepository.saveUser(newUser)
+-                    currentUser.value = newUser
+-                    onResult(true, null)
++                        phone = phone.ifBlank { email },
++                        holding = "",
++                        road = "",
++                        block = ""
++                    )) {
++                        is FunctionsRepository.Outcome.Success -> {
++                            // Firestore listener (allUsers stream) will pick up the new
++                            // profile shortly; poll the local cache once it's synced.
++                            onResult(true, null)
++                        }
++                        is FunctionsRepository.Outcome.Failure -> {
++                            onResult(false, outcome.message)
++                        }
++                    }
+                 } else {
+                     onResult(false, "Failed to create Firebase user account")
+                 }
+@@ -295,41 +269,102 @@ class ClubViewModel(application: Application) : AndroidViewModel(application) {
+         }
+     }
+ 
++    /**
++     * Creates a real Pending donation/payment record server-side (no more fabricated
++     * "Completed" status or txId). Callers should immediately follow up with
++     * initiatePipraPayCheckout(financialRecordId, ...) to actually collect the payment —
++     * this function only creates the record, it never marks anything paid.
++     */
+     fun processPayment(
+-        userId: String,
+-        amount: Double,
+         titleEn: String,
+         titleBn: String,
+-        gateway: String,
+-        type: String, // "Paid" or "Donation"
+-        onComplete: (txId: String) -> Unit
++        amount: Double,
++        purpose: String,
++        onResult: (financialRecordId: String?, error: String?) -> Unit
+     ) {
+         viewModelScope.launch {
+-            val txId = "${gateway.take(2).uppercase()}${System.currentTimeMillis().toString().takeLast(8)}"
+-            val record = FinancialRecordEntity(
+-                userId = userId,
+-                titleEn = titleEn,
+-                titleBn = titleBn,
+-                amount = amount,
+-                type = type,
+-                monthYear = "July 2026",
+-                date = "2026-07-26",
+-                paymentGateway = gateway,
+-                transactionId = txId,
+-                status = "Completed"
+-            )
+-            repository.insertFinancialRecord(record)
+-            firestoreRepository.addFinancialRecord(record)
+-            onComplete(txId)
++            when (val outcome = functionsRepository.createPendingDonation(titleEn, titleBn, amount, purpose)) {
++                is FunctionsRepository.Outcome.Success -> onResult(outcome.value, null)
++                is FunctionsRepository.Outcome.Failure -> onResult(null, outcome.message)
++            }
++        }
++    }
++
++    fun initiateBkashCheckout(
++        financialRecordFirestoreId: String,
++        callbackUrl: String,
++        onResult: (bkashUrl: String?, paymentId: String?, error: String?) -> Unit
++    ) {
++        viewModelScope.launch {
++            when (val outcome = functionsRepository.initiateBkashPayment(financialRecordFirestoreId, callbackUrl)) {
++                is FunctionsRepository.Outcome.Success -> {
++                    val (paymentId, bkashUrl) = outcome.value
++                    onResult(bkashUrl, paymentId, null)
++                }
++                is FunctionsRepository.Outcome.Failure -> onResult(null, null, outcome.message)
++            }
++        }
++    }
++
++    fun confirmBkashCheckout(
++        financialRecordFirestoreId: String,
++        paymentId: String,
++        onResult: (success: Boolean, statusOrError: String) -> Unit
++    ) {
++        viewModelScope.launch {
++            when (val outcome = functionsRepository.executeBkashPayment(financialRecordFirestoreId, paymentId)) {
++                is FunctionsRepository.Outcome.Success -> {
++                    val (status, trxId) = outcome.value
++                    onResult(status == "Completed", trxId ?: status ?: "Unknown")
++                }
++                is FunctionsRepository.Outcome.Failure -> onResult(false, outcome.message)
++            }
+         }
+     }
+ 
+-    fun markDueAsPaid(record: FinancialRecordEntity, gateway: String, onComplete: (txId: String) -> Unit) {
++    /**
++     * PipraPay — recommended default gateway (self-hosted, no bKash merchant agreement
++     * required). Opens a checkout session; the UI should launch checkoutUrl in a Custom
++     * Tab / WebView. Completion is confirmed server-side via the webhook first, with
++     * confirmPipraPayCheckout below as a redirect-flow fallback — never assume success
++     * just because this call returned a URL.
++     */
++    fun initiatePipraPayCheckout(
++        financialRecordFirestoreId: String,
++        redirectUrl: String,
++        cancelUrl: String,
++        onResult: (checkoutUrl: String?, ppId: String?, error: String?) -> Unit
++    ) {
+         viewModelScope.launch {
+-            val txId = "${gateway.take(2).uppercase()}${System.currentTimeMillis().toString().takeLast(8)}"
+-            repository.updatePaymentStatus(record.id, "Completed", txId, gateway)
+-            firestoreRepository.updatePaymentStatus(record.id.toString(), "Completed", txId, gateway)
+-            onComplete(txId)
++            when (val outcome = functionsRepository.initiatePipraPayCharge(financialRecordFirestoreId, redirectUrl, cancelUrl)) {
++                is FunctionsRepository.Outcome.Success -> {
++                    val (checkoutUrl, ppId) = outcome.value
++                    onResult(checkoutUrl, ppId, null)
++                }
++                is FunctionsRepository.Outcome.Failure -> onResult(null, null, outcome.message)
++            }
++        }
++    }
++
++    /**
++     * Fallback confirmation for the PipraPay redirect flow. The webhook (server-to-server)
++     * is the primary path and usually resolves first; this exists for when the resident's
++     * connection drops before the webhook lands. Still independently re-verified with
++     * PipraPay's own API server-side — see functions/index.js confirmPipraPayPayment.
++     */
++    fun confirmPipraPayCheckout(
++        financialRecordFirestoreId: String,
++        ppId: String,
++        onResult: (success: Boolean, statusOrError: String) -> Unit
++    ) {
++        viewModelScope.launch {
++            when (val outcome = functionsRepository.confirmPipraPayPayment(financialRecordFirestoreId, ppId)) {
++                is FunctionsRepository.Outcome.Success -> {
++                    val (success, status) = outcome.value
++                    onResult(success, status ?: "Unknown")
++                }
++                is FunctionsRepository.Outcome.Failure -> onResult(false, outcome.message)
++            }
+         }
+     }
+ 
+@@ -368,8 +403,10 @@ class ClubViewModel(application: Application) : AndroidViewModel(application) {
+ 
+     fun approveUserMembership(userId: String) {
+         viewModelScope.launch {
++            val outcome = functionsRepository.approveMembership(userId, "Active")
++            if (outcome is FunctionsRepository.Outcome.Failure) return@launch
++            // Local cache mirrors the server result; not the source of truth.
+             repository.updateMembershipStatus(userId, "Active")
+-            firestoreRepository.updateMembershipStatus(userId, "Active")
+ 
+             val log = ActivityLogEntity(
+                 id = "LOG-${System.currentTimeMillis()}",
+@@ -388,23 +425,25 @@ class ClubViewModel(application: Application) : AndroidViewModel(application) {
+         }
+     }
+ 
+-    fun updateComplaintStatus(id: Long, status: String, noteEn: String, noteBn: String) {
++    fun updateComplaintStatus(complaint: ComplaintEntity, status: String, noteEn: String, noteBn: String) {
+         viewModelScope.launch {
++            if (complaint.firestoreId.isBlank()) return@launch
+             val now = "2026-07-25 16:05"
+-            repository.updateComplaintStatus(id, status, noteEn, noteBn, now)
+-            firestoreRepository.updateComplaintStatus(id, status, noteEn, noteBn, now)
++            val outcome = functionsRepository.updateComplaintStatus(complaint.firestoreId, status, noteEn, noteBn)
++            if (outcome is FunctionsRepository.Outcome.Failure) return@launch
++            repository.updateComplaintStatus(complaint.firestoreId, status, noteEn, noteBn, now)
+ 
+             val log = ActivityLogEntity(
+                 id = "LOG-${System.currentTimeMillis()}",
+                 actionType = "COMPLAINT_UPDATE",
+                 adminId = currentUser.value?.id ?: "ADM-001",
+                 adminName = currentUser.value?.nameEn ?: "Maintenance Admin",
+-                titleEn = "Updated Complaint #$id to $status",
+-                titleBn = "অভিযোগ #$id এর স্ট্যাটাস $status করা হয়েছে",
++                titleEn = "Updated Complaint #${complaint.id} to $status",
++                titleBn = "অভিযোগ #${complaint.id} এর স্ট্যাটাস $status করা হয়েছে",
+                 detailsEn = "Admin Remark: ${if (noteEn.isBlank()) "Status changed to $status" else noteEn}",
+                 detailsBn = "অ্যাডমিন নোট: ${if (noteBn.isBlank()) "স্ট্যাটাস পরিবর্তন: $status" else noteBn}",
+                 timestamp = now,
+-                targetId = "CMP-$id"
++                targetId = "CMP-${complaint.id}"
+             )
+             repository.insertActivityLog(log)
+             firestoreRepository.addActivityLog(log)
+@@ -459,11 +498,36 @@ class ClubViewModel(application: Application) : AndroidViewModel(application) {
+         amount: Double,
+         adjustmentType: String,
+         noteEn: String,
+-        noteBn: String
++        noteBn: String,
++        onResult: (Boolean, String?) -> Unit = { _, _ -> }
+     ) {
+         viewModelScope.launch {
+             val now = "2026-07-25 16:05"
++
++            // financials/{} denies ALL direct client writes (see firestore.rules) —
++            // this now goes through the admin-gated recordFinancialAdjustment Cloud
++            // Function, which is the only thing allowed to create the doc.
++            val outcome = functionsRepository.recordFinancialAdjustment(
++                targetUserId = targetUserId,
++                titleEn = titleEn,
++                titleBn = titleBn,
++                amount = amount,
++                adjustmentType = adjustmentType,
++                noteEn = noteEn,
++                noteBn = noteBn
++            )
++            val recordId = when (outcome) {
++                is FunctionsRepository.Outcome.Success -> outcome.value
++                is FunctionsRepository.Outcome.Failure -> {
++                    onResult(false, outcome.message)
++                    return@launch
++                }
++            }
++
++            // Mirror into the local cache for offline viewing; the Cloud Function
++            // write above (Admin SDK) is the source of truth.
+             val record = FinancialRecordEntity(
++                firestoreId = recordId ?: "",
+                 userId = targetUserId,
+                 titleEn = titleEn,
+                 titleBn = titleBn,
+@@ -476,7 +540,6 @@ class ClubViewModel(application: Application) : AndroidViewModel(application) {
+                 status = "Completed"
+             )
+             repository.insertFinancialRecord(record)
+-            firestoreRepository.addFinancialRecord(record)
+ 
+             val log = ActivityLogEntity(
+                 id = "LOG-${System.currentTimeMillis()}",
+@@ -492,6 +555,7 @@ class ClubViewModel(application: Application) : AndroidViewModel(application) {
+             )
+             repository.insertActivityLog(log)
+             firestoreRepository.addActivityLog(log)
++            onResult(true, null)
+         }
+     }
+ }
+diff --git a/app/src/main/java/com/example/ui/viewmodel/ComplaintsViewModel.kt b/app/src/main/java/com/example/ui/viewmodel/ComplaintsViewModel.kt
+index a01f583..f197801 100644
+--- a/app/src/main/java/com/example/ui/viewmodel/ComplaintsViewModel.kt
++++ b/app/src/main/java/com/example/ui/viewmodel/ComplaintsViewModel.kt
+@@ -18,6 +18,7 @@ import java.util.Locale
+ class ComplaintsViewModel(application: Application) : AndroidViewModel(application) {
+     private val firestoreRepository = FirestoreRepository()
+     private val clubRepository = ClubRepository(AppDatabase.getDatabase(application))
++    private val functionsRepository = com.example.data.repository.FunctionsRepository()
+ 
+     private val _currentUserId = MutableStateFlow("USR-101")
+     val currentUserId: StateFlow<String> = _currentUserId.asStateFlow()
+@@ -124,25 +125,30 @@ class ComplaintsViewModel(application: Application) : AndroidViewModel(applicati
+         viewModelScope.launch {
+             val now = SimpleDateFormat("yyyy-MM-dd HH:mm", Locale.getDefault()).format(Date())
+ 
+-            // Update in Firestore
+-            firestoreRepository.updateComplaintStatus(
+-                complaintId = complaint.id,
++            if (complaint.firestoreId.isBlank()) return@launch
++
++            // Server enforces admin-only here (firestore.rules also denies this
++            // collection to non-admin client writes) — a non-admin calling this
++            // will simply get a permission-denied error back from the function.
++            val outcome = functionsRepository.updateComplaintStatus(
++                complaintId = complaint.firestoreId,
+                 status = newStatus,
+-                adminNoteEn = adminNoteEn,
+-                adminNoteBn = adminNoteBn,
+-                updatedAt = now
++                noteEn = adminNoteEn,
++                noteBn = adminNoteBn
+             )
++            if (outcome is com.example.data.repository.FunctionsRepository.Outcome.Failure) {
++                return@launch
++            }
+ 
+-            // Update in local Room DB
++            // Mirror into the local cache; the server write above is the source of truth.
+             clubRepository.updateComplaintStatus(
+-                id = complaint.id,
++                firestoreId = complaint.firestoreId,
+                 status = newStatus,
+                 noteEn = adminNoteEn,
+                 noteBn = adminNoteBn,
+                 updatedAt = now
+             )
+ 
+-            // Trigger FCM Push Notification
+             com.example.util.NotificationHelper.showNotification(
+                 context = getApplication(),
+                 title = "🔔 Complaint Status Update: $newStatus",
+diff --git a/app/src/main/java/com/example/ui/viewmodel/FinancialsViewModel.kt b/app/src/main/java/com/example/ui/viewmodel/FinancialsViewModel.kt
+deleted file mode 100644
+index fac82ed..0000000
+--- a/app/src/main/java/com/example/ui/viewmodel/FinancialsViewModel.kt
++++ /dev/null
+@@ -1,153 +0,0 @@
+-package com.example.ui.viewmodel
+-
+-import android.app.Application
+-import androidx.lifecycle.AndroidViewModel
+-import androidx.lifecycle.viewModelScope
+-import com.example.data.db.AppDatabase
+-import com.example.data.model.FinancialRecordEntity
+-import com.example.data.repository.ClubRepository
+-import com.example.data.repository.FirestoreRepository
+-import kotlinx.coroutines.ExperimentalCoroutinesApi
+-import kotlinx.coroutines.flow.*
+-import kotlinx.coroutines.launch
+-
+-@OptIn(ExperimentalCoroutinesApi::class)
+-class FinancialsViewModel(application: Application) : AndroidViewModel(application) {
+-    private val firestoreRepository = FirestoreRepository()
+-    private val clubRepository = ClubRepository(AppDatabase.getDatabase(application))
+-
+-    private val _currentUserId = MutableStateFlow("USR-101")
+-    val currentUserId: StateFlow<String> = _currentUserId.asStateFlow()
+-
+-    private val _isLoading = MutableStateFlow(true)
+-    val isLoading: StateFlow<Boolean> = _isLoading.asStateFlow()
+-
+-    // Real-time stream of user financial records from Firestore with Room database fallback
+-    val userFinancials: StateFlow<List<FinancialRecordEntity>> = _currentUserId
+-        .flatMapLatest { userId ->
+-            combine(
+-                firestoreRepository.getUserFinancialsStream(userId).catch { emit(emptyList()) },
+-                clubRepository.getFinancialsByUserId(userId)
+-            ) { firestoreRecords, roomRecords ->
+-                _isLoading.value = false
+-                if (firestoreRecords.isNotEmpty()) {
+-                    firestoreRecords
+-                } else {
+-                    roomRecords
+-                }
+-            }
+-        }
+-        .stateIn(
+-            viewModelScope,
+-            SharingStarted.WhileSubscribed(5000),
+-            emptyList()
+-        )
+-
+-    // All financial records (for Admin / General overview)
+-    val allFinancials: StateFlow<List<FinancialRecordEntity>> = combine(
+-        firestoreRepository.getAllFinancialsStream().catch { emit(emptyList()) },
+-        clubRepository.allFinancials
+-    ) { firestoreRecords, roomRecords ->
+-        if (firestoreRecords.isNotEmpty()) firestoreRecords else roomRecords
+-    }.stateIn(
+-        viewModelScope,
+-        SharingStarted.WhileSubscribed(5000),
+-        emptyList()
+-    )
+-
+-    // Flow for tracking current unpaid Dues amount sum
+-    val totalDuesAmount: StateFlow<Double> = userFinancials.map { records ->
+-        records.filter { it.type.equals("Due", ignoreCase = true) && !it.status.equals("Completed", ignoreCase = true) }
+-            .sumOf { it.amount }
+-    }.stateIn(viewModelScope, SharingStarted.WhileSubscribed(5000), 0.0)
+-
+-    // Flow for tracking total Paid amounts sum
+-    val totalPaidAmount: StateFlow<Double> = userFinancials.map { records ->
+-        records.filter { (it.type.equals("Paid", ignoreCase = true) || it.type.equals("Due", ignoreCase = true)) && it.status.equals("Completed", ignoreCase = true) }
+-            .sumOf { it.amount }
+-    }.stateIn(viewModelScope, SharingStarted.WhileSubscribed(5000), 0.0)
+-
+-    // Flow for tracking total Donations amount sum
+-    val totalDonationAmount: StateFlow<Double> = userFinancials.map { records ->
+-        records.filter { it.type.equals("Donation", ignoreCase = true) && it.status.equals("Completed", ignoreCase = true) }
+-            .sumOf { it.amount }
+-    }.stateIn(viewModelScope, SharingStarted.WhileSubscribed(5000), 0.0)
+-
+-    // Unpaid Dues list
+-    val pendingDuesList: StateFlow<List<FinancialRecordEntity>> = userFinancials.map { records ->
+-        records.filter { it.type.equals("Due", ignoreCase = true) && !it.status.equals("Completed", ignoreCase = true) }
+-    }.stateIn(viewModelScope, SharingStarted.WhileSubscribed(5000), emptyList())
+-
+-    // Completed Paid transactions history
+-    val paidHistoryList: StateFlow<List<FinancialRecordEntity>> = userFinancials.map { records ->
+-        records.filter { it.status.equals("Completed", ignoreCase = true) && !it.type.equals("Donation", ignoreCase = true) }
+-    }.stateIn(viewModelScope, SharingStarted.WhileSubscribed(5000), emptyList())
+-
+-    // Donation History
+-    val donationHistoryList: StateFlow<List<FinancialRecordEntity>> = userFinancials.map { records ->
+-        records.filter { it.type.equals("Donation", ignoreCase = true) }
+-    }.stateIn(viewModelScope, SharingStarted.WhileSubscribed(5000), emptyList())
+-
+-    fun setCurrentUserId(userId: String) {
+-        _currentUserId.value = userId
+-    }
+-
+-    /**
+-     * Submit a payment for an existing due or financial record.
+-     */
+-    fun processPayment(
+-        record: FinancialRecordEntity,
+-        paymentGateway: String,
+-        transactionId: String
+-    ) {
+-        viewModelScope.launch {
+-            _isLoading.value = true
+-            // Update in Firestore
+-            firestoreRepository.updatePaymentStatus(
+-                documentId = record.id.toString(),
+-                status = "Completed",
+-                transactionId = transactionId,
+-                paymentGateway = paymentGateway
+-            )
+-            // Update in local Room DB
+-            clubRepository.updatePaymentStatus(
+-                id = record.id,
+-                status = "Completed",
+-                txId = transactionId,
+-                gateway = paymentGateway
+-            )
+-            _isLoading.value = false
+-        }
+-    }
+-
+-    /**
+-     * Create and record a new voluntary donation in Firestore and local Room database.
+-     */
+-    fun recordDonation(
+-        userId: String,
+-        amount: Double,
+-        titleEn: String,
+-        titleBn: String,
+-        paymentGateway: String,
+-        transactionId: String
+-    ) {
+-        viewModelScope.launch {
+-            _isLoading.value = true
+-            val donationRecord = FinancialRecordEntity(
+-                userId = userId,
+-                titleEn = titleEn,
+-                titleBn = titleBn,
+-                amount = amount,
+-                type = "Donation",
+-                monthYear = "July 2026",
+-                date = "2026-07-25",
+-                paymentGateway = paymentGateway,
+-                transactionId = transactionId,
+-                status = "Completed"
+-            )
+-            firestoreRepository.addFinancialRecord(donationRecord)
+-            clubRepository.insertFinancialRecord(donationRecord)
+-            _isLoading.value = false
+-        }
+-    }
+-}
+diff --git a/app/src/main/res/xml/backup_rules.xml b/app/src/main/res/xml/backup_rules.xml
+index 90529f8..f703035 100644
+--- a/app/src/main/res/xml/backup_rules.xml
++++ b/app/src/main/res/xml/backup_rules.xml
+@@ -6,8 +6,10 @@
+    See https://developer.android.com/about/versions/12/backup-restore
+ -->
+ <full-backup-content>
+-    <!--
+-   <include domain="sharedpref" path="."/>
+-   <exclude domain="sharedpref" path="device.xml"/>
+--->
++    <!-- Excluded: local resident DB holds NID references, addresses, phone numbers,
++         and financial records. Firestore is the durable backend; the local Room DB
++         is a cache only and must not be swept into Android's cloud/device backup. -->
++    <exclude domain="database" path="kunjachhaya_club_db" />
++    <exclude domain="database" path="kunjachhaya_club_db-wal" />
++    <exclude domain="database" path="kunjachhaya_club_db-shm" />
+ </full-backup-content>
+diff --git a/app/src/main/res/xml/data_extraction_rules.xml b/app/src/main/res/xml/data_extraction_rules.xml
+index 0c4f95c..b98c3ec 100644
+--- a/app/src/main/res/xml/data_extraction_rules.xml
++++ b/app/src/main/res/xml/data_extraction_rules.xml
+@@ -5,15 +5,13 @@
+ -->
+ <data-extraction-rules>
+     <cloud-backup>
+-        <!-- TODO: Use <include> and <exclude> to control what is backed up.
+-        <include .../>
+-        <exclude .../>
+-        -->
++        <exclude domain="database" path="kunjachhaya_club_db" />
++        <exclude domain="database" path="kunjachhaya_club_db-wal" />
++        <exclude domain="database" path="kunjachhaya_club_db-shm" />
+     </cloud-backup>
+-    <!--
+     <device-transfer>
+-        <include .../>
+-        <exclude .../>
++        <exclude domain="database" path="kunjachhaya_club_db" />
++        <exclude domain="database" path="kunjachhaya_club_db-wal" />
++        <exclude domain="database" path="kunjachhaya_club_db-shm" />
+     </device-transfer>
+-    -->
+ </data-extraction-rules>
+diff --git a/gradle/libs.versions.toml b/gradle/libs.versions.toml
+index b91270d..676c9ca 100644
+--- a/gradle/libs.versions.toml
++++ b/gradle/libs.versions.toml
+@@ -1,5 +1,6 @@
+ [versions]
+ agp = "9.1.1"
++browser = "1.8.0"
+ coreKtx = "1.18.0"
+ junit = "4.13.2"
+ junitVersion = "1.3.0"
+@@ -45,6 +46,7 @@ biometric = "1.1.0"
+ 
+ 
+ [libraries]
++androidx-browser = { group = "androidx.browser", name = "browser", version.ref = "browser" }
+ androidx-biometric = { group = "androidx.biometric", name = "biometric", version.ref = "biometric" }
+ androidx-core-ktx = { group = "androidx.core", name = "core-ktx", version.ref = "coreKtx" }
+ junit = { group = "junit", name = "junit", version.ref = "junit" }
+diff --git a/web/package-lock.json b/web/package-lock.json
+index 8e6e091..dc24f76 100644
+--- a/web/package-lock.json
++++ b/web/package-lock.json
+@@ -8,7 +8,7 @@
+       "name": "kunjachaya-club-web",
+       "version": "1.0.0",
+       "dependencies": {
+-        "jspdf": "^2.5.1",
++        "jspdf": "^4.2.1",
+         "lucide-react": "^0.344.0",
+         "react": "^18.2.0",
+         "react-dom": "^18.2.0"
+@@ -16,11 +16,11 @@
+       "devDependencies": {
+         "@types/react": "^18.2.66",
+         "@types/react-dom": "^18.2.22",
+-        "@vitejs/plugin-react": "^4.2.1",
++        "@vitejs/plugin-react": "^6.0.4",
+         "autoprefixer": "^10.4.18",
+         "postcss": "^8.4.35",
+         "tailwindcss": "^3.4.1",
+-        "vite": "^5.1.6"
++        "vite": "^8.1.5"
+       }
+     },
+     "node_modules/@alloc/quick-lru": {
+@@ -36,686 +36,50 @@
+         "url": "https://github.com/sponsors/sindresorhus"
+       }
+     },
+-    "node_modules/@babel/code-frame": {
+-      "version": "7.29.7",
+-      "resolved": "https://registry.npmjs.org/@babel/code-frame/-/code-frame-7.29.7.tgz",
+-      "integrity": "sha512-Aup7aUOfpbAUg2ROOJN6Iw5f9DMBlzu0mIkm/malLQFN/YQgO48wCj0Kxa3sEHJvPVFg7siR+qRInwXd2qhQKw==",
+-      "dev": true,
+-      "license": "MIT",
+-      "dependencies": {
+-        "@babel/helper-validator-identifier": "^7.29.7",
+-        "js-tokens": "^4.0.0",
+-        "picocolors": "^1.1.1"
+-      },
+-      "engines": {
+-        "node": ">=6.9.0"
+-      }
+-    },
+-    "node_modules/@babel/compat-data": {
+-      "version": "7.29.7",
+-      "resolved": "https://registry.npmjs.org/@babel/compat-data/-/compat-data-7.29.7.tgz",
+-      "integrity": "sha512-locTkQyKvwIEgBzVrn8693ebc97F2U8ZHjbXwDXJ5Fn2TCpNwTlKcaKLkdHop5c/icOFE7qt7Q9JC5hnKNa6Gg==",
+-      "dev": true,
+-      "license": "MIT",
+-      "engines": {
+-        "node": ">=6.9.0"
+-      }
+-    },
+-    "node_modules/@babel/core": {
+-      "version": "7.29.7",
+-      "resolved": "https://registry.npmjs.org/@babel/core/-/core-7.29.7.tgz",
+-      "integrity": "sha512-RgHBCvtjbOK2gXSNBNIkNoEc9qoVEtau3hj8gEqKQuL3HZAibKarWFEI3Lfm6EYKkLalOh8eSrj9b+ch9H/VBA==",
+-      "dev": true,
+-      "license": "MIT",
+-      "dependencies": {
+-        "@babel/code-frame": "^7.29.7",
+-        "@babel/generator": "^7.29.7",
+-        "@babel/helper-compilation-targets": "^7.29.7",
+-        "@babel/helper-module-transforms": "^7.29.7",
+-        "@babel/helpers": "^7.29.7",
+-        "@babel/parser": "^7.29.7",
+-        "@babel/template": "^7.29.7",
+-        "@babel/traverse": "^7.29.7",
+-        "@babel/types": "^7.29.7",
+-        "@jridgewell/remapping": "^2.3.5",
+-        "convert-source-map": "^2.0.0",
+-        "debug": "^4.1.0",
+-        "gensync": "^1.0.0-beta.2",
+-        "json5": "^2.2.3",
+-        "semver": "^6.3.1"
+-      },
+-      "engines": {
+-        "node": ">=6.9.0"
+-      },
+-      "funding": {
+-        "type": "opencollective",
+-        "url": "https://opencollective.com/babel"
+-      }
+-    },
+-    "node_modules/@babel/generator": {
+-      "version": "7.29.7",
+-      "resolved": "https://registry.npmjs.org/@babel/generator/-/generator-7.29.7.tgz",
+-      "integrity": "sha512-DkXD5OJQaAQIdZ1bt3UZdEnHAn9Imd3IVBdX03UFe+ony9Ojw5pzr9YVKGDY1jt+Gcn/FnGkNf8r+Vj5NOJWtQ==",
+-      "dev": true,
+-      "license": "MIT",
+-      "dependencies": {
+-        "@babel/parser": "^7.29.7",
+-        "@babel/types": "^7.29.7",
+-        "@jridgewell/gen-mapping": "^0.3.12",
+-        "@jridgewell/trace-mapping": "^0.3.28",
+-        "jsesc": "^3.0.2"
+-      },
+-      "engines": {
+-        "node": ">=6.9.0"
+-      }
+-    },
+-    "node_modules/@babel/helper-compilation-targets": {
+-      "version": "7.29.7",
+-      "resolved": "https://registry.npmjs.org/@babel/helper-compilation-targets/-/helper-compilation-targets-7.29.7.tgz",
+-      "integrity": "sha512-wem6WaBj4NaVYVdNhLPPVacES6ZJ+KBBfSkTMD3YZxbP3rm3Di85tJU5ljaUNhaOynt+Aj0xruhYuzQBt8n71g==",
+-      "dev": true,
+-      "license": "MIT",
+-      "dependencies": {
+-        "@babel/compat-data": "^7.29.7",
+-        "@babel/helper-validator-option": "^7.29.7",
+-        "browserslist": "^4.24.0",
+-        "lru-cache": "^5.1.1",
+-        "semver": "^6.3.1"
+-      },
+-      "engines": {
+-        "node": ">=6.9.0"
+-      }
+-    },
+-    "node_modules/@babel/helper-globals": {
+-      "version": "7.29.7",
+-      "resolved": "https://registry.npmjs.org/@babel/helper-globals/-/helper-globals-7.29.7.tgz",
+-      "integrity": "sha512-3nQVUAtvkKH9zahfWgw96Jc/uFOmjACE1kQz82E2lqWmHBgjzbNlsC22nuQTfahmWeQtTq5nQ/4Nnd2A1wj4zA==",
+-      "dev": true,
+-      "license": "MIT",
+-      "engines": {
+-        "node": ">=6.9.0"
+-      }
+-    },
+-    "node_modules/@babel/helper-module-imports": {
+-      "version": "7.29.7",
+-      "resolved": "https://registry.npmjs.org/@babel/helper-module-imports/-/helper-module-imports-7.29.7.tgz",
+-      "integrity": "sha512-ejHwrQQYcm9xnTivShn2IDOlIzInN34AXskvq9QicvCtEzq1Vzclu/tKF8Jq1Cg8JG2GL6/EmjgsCT7lXepE3g==",
+-      "dev": true,
+-      "license": "MIT",
+-      "dependencies": {
+-        "@babel/traverse": "^7.29.7",
+-        "@babel/types": "^7.29.7"
+-      },
+-      "engines": {
+-        "node": ">=6.9.0"
+-      }
+-    },
+-    "node_modules/@babel/helper-module-transforms": {
+-      "version": "7.29.7",
+-      "resolved": "https://registry.npmjs.org/@babel/helper-module-transforms/-/helper-module-transforms-7.29.7.tgz",
+-      "integrity": "sha512-UPUVSyXbOh627KiCIGQSgwWzGeBKLkaJ9PJEdrngIwMSzxLR4jS4+f1f1jb7VzBbg8nFLaYotvVPFCTqdrmTAg==",
+-      "dev": true,
+-      "license": "MIT",
+-      "dependencies": {
+-        "@babel/helper-module-imports": "^7.29.7",
+-        "@babel/helper-validator-identifier": "^7.29.7",
+-        "@babel/traverse": "^7.29.7"
+-      },
+-      "engines": {
+-        "node": ">=6.9.0"
+-      },
+-      "peerDependencies": {
+-        "@babel/core": "^7.0.0"
+-      }
+-    },
+-    "node_modules/@babel/helper-plugin-utils": {
+-      "version": "7.29.7",
+-      "resolved": "https://registry.npmjs.org/@babel/helper-plugin-utils/-/helper-plugin-utils-7.29.7.tgz",
+-      "integrity": "sha512-G7sHYigPY17oO5SYWnfD/0MTBwVR781S/JI643e/JhUYgVgWE/61SoW3NH9KWUKyKq5LVh3npif99Wkt6j86Jw==",
+-      "dev": true,
+-      "license": "MIT",
+-      "engines": {
+-        "node": ">=6.9.0"
+-      }
+-    },
+-    "node_modules/@babel/helper-string-parser": {
+-      "version": "7.29.7",
+-      "resolved": "https://registry.npmjs.org/@babel/helper-string-parser/-/helper-string-parser-7.29.7.tgz",
+-      "integrity": "sha512-Pb5ijPrZ89GDH8223L4UP8i6QApWxs04RbPQJTeWDV0/keR2E36MeKnyr6LYmUUvqRRI+Iv87SuF1W6ErINzYw==",
+-      "dev": true,
+-      "license": "MIT",
+-      "engines": {
+-        "node": ">=6.9.0"
+-      }
+-    },
+-    "node_modules/@babel/helper-validator-identifier": {
+-      "version": "7.29.7",
+-      "resolved": "https://registry.npmjs.org/@babel/helper-validator-identifier/-/helper-validator-identifier-7.29.7.tgz",
+-      "integrity": "sha512-qehxGkRj55h/ff8EMaJ+cYhyaKlHIxqYDn682wQD7RNp9UujOQsHog2uS0r2vzr4pW+sXf90NeeayjcNaX3fFg==",
+-      "dev": true,
+-      "license": "MIT",
+-      "engines": {
+-        "node": ">=6.9.0"
+-      }
+-    },
+-    "node_modules/@babel/helper-validator-option": {
+-      "version": "7.29.7",
+-      "resolved": "https://registry.npmjs.org/@babel/helper-validator-option/-/helper-validator-option-7.29.7.tgz",
+-      "integrity": "sha512-N9ZErrD+yW5geCDtBqnOoxmR8+tNKiGuxKlDpuJxfsqpa2dFcexaziGAE/qoHLiDDreVNMupxGmSoNlyvsA3gw==",
+-      "dev": true,
+-      "license": "MIT",
+-      "engines": {
+-        "node": ">=6.9.0"
+-      }
+-    },
+-    "node_modules/@babel/helpers": {
+-      "version": "7.29.7",
+-      "resolved": "https://registry.npmjs.org/@babel/helpers/-/helpers-7.29.7.tgz",
+-      "integrity": "sha512-1k2lAGRMfHTcwuNYcCNUmaUffmQv8KWMfh2iJUUeRlwlwH4FdNG7mfPI10NPfLHJFThE4Tyr4mv7kTNZOiPuBg==",
+-      "dev": true,
+-      "license": "MIT",
+-      "dependencies": {
+-        "@babel/template": "^7.29.7",
+-        "@babel/types": "^7.29.7"
+-      },
+-      "engines": {
+-        "node": ">=6.9.0"
+-      }
+-    },
+-    "node_modules/@babel/parser": {
+-      "version": "7.29.7",
+-      "resolved": "https://registry.npmjs.org/@babel/parser/-/parser-7.29.7.tgz",
+-      "integrity": "sha512-hnORnjP/1P/zFEndoeX+n+t1RwWRJiJpM/jO7FW32Kn9r5+sJB2JWOdYo4L6k78j15eCwY3Gm/7364B1EMwtNg==",
+-      "dev": true,
+-      "license": "MIT",
+-      "dependencies": {
+-        "@babel/types": "^7.29.7"
+-      },
+-      "bin": {
+-        "parser": "bin/babel-parser.js"
+-      },
+-      "engines": {
+-        "node": ">=6.0.0"
+-      }
+-    },
+-    "node_modules/@babel/plugin-transform-react-jsx-self": {
+-      "version": "7.29.7",
+-      "resolved": "https://registry.npmjs.org/@babel/plugin-transform-react-jsx-self/-/plugin-transform-react-jsx-self-7.29.7.tgz",
+-      "integrity": "sha512-TL0hMc9xzy86VD31nUiwzd5otRAcyEPcsegCxolO0PvcXuH1v0kECe/UIznYFihpkvU5wg/jk4v0TTEFfm53fw==",
+-      "dev": true,
+-      "license": "MIT",
+-      "dependencies": {
+-        "@babel/helper-plugin-utils": "^7.29.7"
+-      },
+-      "engines": {
+-        "node": ">=6.9.0"
+-      },
+-      "peerDependencies": {
+-        "@babel/core": "^7.0.0-0"
+-      }
+-    },
+-    "node_modules/@babel/plugin-transform-react-jsx-source": {
+-      "version": "7.29.7",
+-      "resolved": "https://registry.npmjs.org/@babel/plugin-transform-react-jsx-source/-/plugin-transform-react-jsx-source-7.29.7.tgz",
+-      "integrity": "sha512-06IyK09H3wi4cGbhDBwp5gUGo0IKtnYa8tyTiephirPCK6fbobVGiXMMI5zLQ4aKEYP3wZ3ArU44o+8KMrSG/Q==",
+-      "dev": true,
+-      "license": "MIT",
+-      "dependencies": {
+-        "@babel/helper-plugin-utils": "^7.29.7"
+-      },
+-      "engines": {
+-        "node": ">=6.9.0"
+-      },
+-      "peerDependencies": {
+-        "@babel/core": "^7.0.0-0"
+-      }
+-    },
+-    "node_modules/@babel/runtime": {
+-      "version": "7.29.7",
+-      "resolved": "https://registry.npmjs.org/@babel/runtime/-/runtime-7.29.7.tgz",
+-      "integrity": "sha512-Nq8OhGWiZIZGV6hLHoyAKLLcJihP/xFeBMGJoUrxTX2psI8dCifzLhZISFb+VWS3wFMRDmCGw5R+dOySCqPLhw==",
+-      "license": "MIT",
+-      "engines": {
+-        "node": ">=6.9.0"
+-      }
+-    },
+-    "node_modules/@babel/template": {
+-      "version": "7.29.7",
+-      "resolved": "https://registry.npmjs.org/@babel/template/-/template-7.29.7.tgz",
+-      "integrity": "sha512-puq+Gf35oI24FeN11LkoUQFqv9uwNeWpxXZi/Ji3rRIoKAzKnxRaZ+Gkj0vKS9ZCiTESfng1N9LyOyXvo+m+Gg==",
+-      "dev": true,
+-      "license": "MIT",
+-      "dependencies": {
+-        "@babel/code-frame": "^7.29.7",
+-        "@babel/parser": "^7.29.7",
+-        "@babel/types": "^7.29.7"
+-      },
+-      "engines": {
+-        "node": ">=6.9.0"
+-      }
+-    },
+-    "node_modules/@babel/traverse": {
+-      "version": "7.29.7",
+-      "resolved": "https://registry.npmjs.org/@babel/traverse/-/traverse-7.29.7.tgz",
+-      "integrity": "sha512-EhlfNQtZ+NK22w5BM61ciuiq1m58ed33Wr1Xan//ZRTy6hgjnwyCffRYwzsGXdASJSUJ1guZILsErh1eQcl+zw==",
+-      "dev": true,
+-      "license": "MIT",
+-      "dependencies": {
+-        "@babel/code-frame": "^7.29.7",
+-        "@babel/generator": "^7.29.7",
+-        "@babel/helper-globals": "^7.29.7",
+-        "@babel/parser": "^7.29.7",
+-        "@babel/template": "^7.29.7",
+-        "@babel/types": "^7.29.7",
+-        "debug": "^4.3.1"
+-      },
+-      "engines": {
+-        "node": ">=6.9.0"
+-      }
+-    },
+-    "node_modules/@babel/types": {
+-      "version": "7.29.7",
+-      "resolved": "https://registry.npmjs.org/@babel/types/-/types-7.29.7.tgz",
+-      "integrity": "sha512-4zBIxpPzowiZpusoFkyGVwakdRJUyuH5PxQ/PrqghfdFWWasvnCdPfQXHrenDai+gyLARulZjZowCOj6fjT4pA==",
+-      "dev": true,
+-      "license": "MIT",
+-      "dependencies": {
+-        "@babel/helper-string-parser": "^7.29.7",
+-        "@babel/helper-validator-identifier": "^7.29.7"
+-      },
+-      "engines": {
+-        "node": ">=6.9.0"
+-      }
+-    },
+-    "node_modules/@esbuild/aix-ppc64": {
+-      "version": "0.21.5",
+-      "resolved": "https://registry.npmjs.org/@esbuild/aix-ppc64/-/aix-ppc64-0.21.5.tgz",
+-      "integrity": "sha512-1SDgH6ZSPTlggy1yI6+Dbkiz8xzpHJEVAlF/AM1tHPLsf5STom9rwtjE4hKAF20FfXXNTFqEYXyJNWh1GiZedQ==",
+-      "cpu": [
+-        "ppc64"
+-      ],
+-      "dev": true,
+-      "license": "MIT",
+-      "optional": true,
+-      "os": [
+-        "aix"
+-      ],
+-      "engines": {
+-        "node": ">=12"
+-      }
+-    },
+-    "node_modules/@esbuild/android-arm": {
+-      "version": "0.21.5",
+-      "resolved": "https://registry.npmjs.org/@esbuild/android-arm/-/android-arm-0.21.5.tgz",
+-      "integrity": "sha512-vCPvzSjpPHEi1siZdlvAlsPxXl7WbOVUBBAowWug4rJHb68Ox8KualB+1ocNvT5fjv6wpkX6o/iEpbDrf68zcg==",
+-      "cpu": [
+-        "arm"
+-      ],
+-      "dev": true,
+-      "license": "MIT",
+-      "optional": true,
+-      "os": [
+-        "android"
+-      ],
+-      "engines": {
+-        "node": ">=12"
+-      }
+-    },
+-    "node_modules/@esbuild/android-arm64": {
+-      "version": "0.21.5",
+-      "resolved": "https://registry.npmjs.org/@esbuild/android-arm64/-/android-arm64-0.21.5.tgz",
+-      "integrity": "sha512-c0uX9VAUBQ7dTDCjq+wdyGLowMdtR/GoC2U5IYk/7D1H1JYC0qseD7+11iMP2mRLN9RcCMRcjC4YMclCzGwS/A==",
+-      "cpu": [
+-        "arm64"
+-      ],
+-      "dev": true,
+-      "license": "MIT",
+-      "optional": true,
+-      "os": [
+-        "android"
+-      ],
+-      "engines": {
+-        "node": ">=12"
+-      }
+-    },
+-    "node_modules/@esbuild/android-x64": {
+-      "version": "0.21.5",
+-      "resolved": "https://registry.npmjs.org/@esbuild/android-x64/-/android-x64-0.21.5.tgz",
+-      "integrity": "sha512-D7aPRUUNHRBwHxzxRvp856rjUHRFW1SdQATKXH2hqA0kAZb1hKmi02OpYRacl0TxIGz/ZmXWlbZgjwWYaCakTA==",
+-      "cpu": [
+-        "x64"
+-      ],
+-      "dev": true,
+-      "license": "MIT",
+-      "optional": true,
+-      "os": [
+-        "android"
+-      ],
+-      "engines": {
+-        "node": ">=12"
+-      }
+-    },
+-    "node_modules/@esbuild/darwin-arm64": {
+-      "version": "0.21.5",
+-      "resolved": "https://registry.npmjs.org/@esbuild/darwin-arm64/-/darwin-arm64-0.21.5.tgz",
+-      "integrity": "sha512-DwqXqZyuk5AiWWf3UfLiRDJ5EDd49zg6O9wclZ7kUMv2WRFr4HKjXp/5t8JZ11QbQfUS6/cRCKGwYhtNAY88kQ==",
+-      "cpu": [
+-        "arm64"
+-      ],
+-      "dev": true,
+-      "license": "MIT",
+-      "optional": true,
+-      "os": [
+-        "darwin"
+-      ],
+-      "engines": {
+-        "node": ">=12"
+-      }
+-    },
+-    "node_modules/@esbuild/darwin-x64": {
+-      "version": "0.21.5",
+-      "resolved": "https://registry.npmjs.org/@esbuild/darwin-x64/-/darwin-x64-0.21.5.tgz",
+-      "integrity": "sha512-se/JjF8NlmKVG4kNIuyWMV/22ZaerB+qaSi5MdrXtd6R08kvs2qCN4C09miupktDitvh8jRFflwGFBQcxZRjbw==",
+-      "cpu": [
+-        "x64"
+-      ],
+-      "dev": true,
+-      "license": "MIT",
+-      "optional": true,
+-      "os": [
+-        "darwin"
+-      ],
+-      "engines": {
+-        "node": ">=12"
+-      }
+-    },
+-    "node_modules/@esbuild/freebsd-arm64": {
+-      "version": "0.21.5",
+-      "resolved": "https://registry.npmjs.org/@esbuild/freebsd-arm64/-/freebsd-arm64-0.21.5.tgz",
+-      "integrity": "sha512-5JcRxxRDUJLX8JXp/wcBCy3pENnCgBR9bN6JsY4OmhfUtIHe3ZW0mawA7+RDAcMLrMIZaf03NlQiX9DGyB8h4g==",
+-      "cpu": [
+-        "arm64"
+-      ],
+-      "dev": true,
+-      "license": "MIT",
+-      "optional": true,
+-      "os": [
+-        "freebsd"
+-      ],
+-      "engines": {
+-        "node": ">=12"
+-      }
+-    },
+-    "node_modules/@esbuild/freebsd-x64": {
+-      "version": "0.21.5",
+-      "resolved": "https://registry.npmjs.org/@esbuild/freebsd-x64/-/freebsd-x64-0.21.5.tgz",
+-      "integrity": "sha512-J95kNBj1zkbMXtHVH29bBriQygMXqoVQOQYA+ISs0/2l3T9/kj42ow2mpqerRBxDJnmkUDCaQT/dfNXWX/ZZCQ==",
+-      "cpu": [
+-        "x64"
+-      ],
+-      "dev": true,
+-      "license": "MIT",
+-      "optional": true,
+-      "os": [
+-        "freebsd"
+-      ],
+-      "engines": {
+-        "node": ">=12"
+-      }
+-    },
+-    "node_modules/@esbuild/linux-arm": {
+-      "version": "0.21.5",
+-      "resolved": "https://registry.npmjs.org/@esbuild/linux-arm/-/linux-arm-0.21.5.tgz",
+-      "integrity": "sha512-bPb5AHZtbeNGjCKVZ9UGqGwo8EUu4cLq68E95A53KlxAPRmUyYv2D6F0uUI65XisGOL1hBP5mTronbgo+0bFcA==",
+-      "cpu": [
+-        "arm"
+-      ],
+-      "dev": true,
+-      "license": "MIT",
+-      "optional": true,
+-      "os": [
+-        "linux"
+-      ],
+-      "engines": {
+-        "node": ">=12"
+-      }
+-    },
+-    "node_modules/@esbuild/linux-arm64": {
+-      "version": "0.21.5",
+-      "resolved": "https://registry.npmjs.org/@esbuild/linux-arm64/-/linux-arm64-0.21.5.tgz",
+-      "integrity": "sha512-ibKvmyYzKsBeX8d8I7MH/TMfWDXBF3db4qM6sy+7re0YXya+K1cem3on9XgdT2EQGMu4hQyZhan7TeQ8XkGp4Q==",
+-      "cpu": [
+-        "arm64"
+-      ],
+-      "dev": true,
+-      "license": "MIT",
+-      "optional": true,
+-      "os": [
+-        "linux"
+-      ],
+-      "engines": {
+-        "node": ">=12"
+-      }
+-    },
+-    "node_modules/@esbuild/linux-ia32": {
+-      "version": "0.21.5",
+-      "resolved": "https://registry.npmjs.org/@esbuild/linux-ia32/-/linux-ia32-0.21.5.tgz",
+-      "integrity": "sha512-YvjXDqLRqPDl2dvRODYmmhz4rPeVKYvppfGYKSNGdyZkA01046pLWyRKKI3ax8fbJoK5QbxblURkwK/MWY18Tg==",
+-      "cpu": [
+-        "ia32"
+-      ],
+-      "dev": true,
+-      "license": "MIT",
+-      "optional": true,
+-      "os": [
+-        "linux"
+-      ],
+-      "engines": {
+-        "node": ">=12"
+-      }
+-    },
+-    "node_modules/@esbuild/linux-loong64": {
+-      "version": "0.21.5",
+-      "resolved": "https://registry.npmjs.org/@esbuild/linux-loong64/-/linux-loong64-0.21.5.tgz",
+-      "integrity": "sha512-uHf1BmMG8qEvzdrzAqg2SIG/02+4/DHB6a9Kbya0XDvwDEKCoC8ZRWI5JJvNdUjtciBGFQ5PuBlpEOXQj+JQSg==",
+-      "cpu": [
+-        "loong64"
+-      ],
+-      "dev": true,
+-      "license": "MIT",
+-      "optional": true,
+-      "os": [
+-        "linux"
+-      ],
+-      "engines": {
+-        "node": ">=12"
+-      }
+-    },
+-    "node_modules/@esbuild/linux-mips64el": {
+-      "version": "0.21.5",
+-      "resolved": "https://registry.npmjs.org/@esbuild/linux-mips64el/-/linux-mips64el-0.21.5.tgz",
+-      "integrity": "sha512-IajOmO+KJK23bj52dFSNCMsz1QP1DqM6cwLUv3W1QwyxkyIWecfafnI555fvSGqEKwjMXVLokcV5ygHW5b3Jbg==",
+-      "cpu": [
+-        "mips64el"
+-      ],
+-      "dev": true,
+-      "license": "MIT",
+-      "optional": true,
+-      "os": [
+-        "linux"
+-      ],
+-      "engines": {
+-        "node": ">=12"
+-      }
+-    },
+-    "node_modules/@esbuild/linux-ppc64": {
+-      "version": "0.21.5",
+-      "resolved": "https://registry.npmjs.org/@esbuild/linux-ppc64/-/linux-ppc64-0.21.5.tgz",
+-      "integrity": "sha512-1hHV/Z4OEfMwpLO8rp7CvlhBDnjsC3CttJXIhBi+5Aj5r+MBvy4egg7wCbe//hSsT+RvDAG7s81tAvpL2XAE4w==",
+-      "cpu": [
+-        "ppc64"
+-      ],
+-      "dev": true,
+-      "license": "MIT",
+-      "optional": true,
+-      "os": [
+-        "linux"
+-      ],
+-      "engines": {
+-        "node": ">=12"
+-      }
+-    },
+-    "node_modules/@esbuild/linux-riscv64": {
+-      "version": "0.21.5",
+-      "resolved": "https://registry.npmjs.org/@esbuild/linux-riscv64/-/linux-riscv64-0.21.5.tgz",
+-      "integrity": "sha512-2HdXDMd9GMgTGrPWnJzP2ALSokE/0O5HhTUvWIbD3YdjME8JwvSCnNGBnTThKGEB91OZhzrJ4qIIxk/SBmyDDA==",
+-      "cpu": [
+-        "riscv64"
+-      ],
+-      "dev": true,
+-      "license": "MIT",
+-      "optional": true,
+-      "os": [
+-        "linux"
+-      ],
+-      "engines": {
+-        "node": ">=12"
+-      }
+-    },
+-    "node_modules/@esbuild/linux-s390x": {
+-      "version": "0.21.5",
+-      "resolved": "https://registry.npmjs.org/@esbuild/linux-s390x/-/linux-s390x-0.21.5.tgz",
+-      "integrity": "sha512-zus5sxzqBJD3eXxwvjN1yQkRepANgxE9lgOW2qLnmr8ikMTphkjgXu1HR01K4FJg8h1kEEDAqDcZQtbrRnB41A==",
+-      "cpu": [
+-        "s390x"
+-      ],
+-      "dev": true,
+-      "license": "MIT",
+-      "optional": true,
+-      "os": [
+-        "linux"
+-      ],
+-      "engines": {
+-        "node": ">=12"
+-      }
+-    },
+-    "node_modules/@esbuild/linux-x64": {
+-      "version": "0.21.5",
+-      "resolved": "https://registry.npmjs.org/@esbuild/linux-x64/-/linux-x64-0.21.5.tgz",
+-      "integrity": "sha512-1rYdTpyv03iycF1+BhzrzQJCdOuAOtaqHTWJZCWvijKD2N5Xu0TtVC8/+1faWqcP9iBCWOmjmhoH94dH82BxPQ==",
+-      "cpu": [
+-        "x64"
+-      ],
+-      "dev": true,
+-      "license": "MIT",
+-      "optional": true,
+-      "os": [
+-        "linux"
+-      ],
+-      "engines": {
+-        "node": ">=12"
+-      }
+-    },
+-    "node_modules/@esbuild/netbsd-x64": {
+-      "version": "0.21.5",
+-      "resolved": "https://registry.npmjs.org/@esbuild/netbsd-x64/-/netbsd-x64-0.21.5.tgz",
+-      "integrity": "sha512-Woi2MXzXjMULccIwMnLciyZH4nCIMpWQAs049KEeMvOcNADVxo0UBIQPfSmxB3CWKedngg7sWZdLvLczpe0tLg==",
+-      "cpu": [
+-        "x64"
+-      ],
+-      "dev": true,
+-      "license": "MIT",
+-      "optional": true,
+-      "os": [
+-        "netbsd"
+-      ],
+-      "engines": {
+-        "node": ">=12"
+-      }
+-    },
+-    "node_modules/@esbuild/openbsd-x64": {
+-      "version": "0.21.5",
+-      "resolved": "https://registry.npmjs.org/@esbuild/openbsd-x64/-/openbsd-x64-0.21.5.tgz",
+-      "integrity": "sha512-HLNNw99xsvx12lFBUwoT8EVCsSvRNDVxNpjZ7bPn947b8gJPzeHWyNVhFsaerc0n3TsbOINvRP2byTZ5LKezow==",
+-      "cpu": [
+-        "x64"
+-      ],
+-      "dev": true,
+-      "license": "MIT",
+-      "optional": true,
+-      "os": [
+-        "openbsd"
+-      ],
+-      "engines": {
+-        "node": ">=12"
+-      }
+-    },
+-    "node_modules/@esbuild/sunos-x64": {
+-      "version": "0.21.5",
+-      "resolved": "https://registry.npmjs.org/@esbuild/sunos-x64/-/sunos-x64-0.21.5.tgz",
+-      "integrity": "sha512-6+gjmFpfy0BHU5Tpptkuh8+uw3mnrvgs+dSPQXQOv3ekbordwnzTVEb4qnIvQcYXq6gzkyTnoZ9dZG+D4garKg==",
+-      "cpu": [
+-        "x64"
+-      ],
+-      "dev": true,
++    "node_modules/@babel/runtime": {
++      "version": "7.29.7",
++      "resolved": "https://registry.npmjs.org/@babel/runtime/-/runtime-7.29.7.tgz",
++      "integrity": "sha512-Nq8OhGWiZIZGV6hLHoyAKLLcJihP/xFeBMGJoUrxTX2psI8dCifzLhZISFb+VWS3wFMRDmCGw5R+dOySCqPLhw==",
+       "license": "MIT",
+-      "optional": true,
+-      "os": [
+-        "sunos"
+-      ],
+       "engines": {
+-        "node": ">=12"
++        "node": ">=6.9.0"
+       }
+     },
+-    "node_modules/@esbuild/win32-arm64": {
+-      "version": "0.21.5",
+-      "resolved": "https://registry.npmjs.org/@esbuild/win32-arm64/-/win32-arm64-0.21.5.tgz",
+-      "integrity": "sha512-Z0gOTd75VvXqyq7nsl93zwahcTROgqvuAcYDUr+vOv8uHhNSKROyU961kgtCD1e95IqPKSQKH7tBTslnS3tA8A==",
+-      "cpu": [
+-        "arm64"
+-      ],
++    "node_modules/@emnapi/core": {
++      "version": "2.0.0-alpha.3",
++      "resolved": "https://registry.npmjs.org/@emnapi/core/-/core-2.0.0-alpha.3.tgz",
++      "integrity": "sha512-AZypUeJ/yByuxyS7BlSNRDOMLMlROYtjYdIAuBmJssVz1UJDSeYxLrdizhXCFYhedC5bqd/ASy8EuNXbVVXp9g==",
+       "dev": true,
+       "license": "MIT",
+       "optional": true,
+-      "os": [
+-        "win32"
+-      ],
+-      "engines": {
+-        "node": ">=12"
++      "peer": true,
++      "dependencies": {
++        "@emnapi/wasi-threads": "2.0.1",
++        "tslib": "^2.4.0"
+       }
+     },
+-    "node_modules/@esbuild/win32-ia32": {
+-      "version": "0.21.5",
+-      "resolved": "https://registry.npmjs.org/@esbuild/win32-ia32/-/win32-ia32-0.21.5.tgz",
+-      "integrity": "sha512-SWXFF1CL2RVNMaVs+BBClwtfZSvDgtL//G/smwAc5oVK/UPu2Gu9tIaRgFmYFFKrmg3SyAjSrElf0TiJ1v8fYA==",
+-      "cpu": [
+-        "ia32"
+-      ],
++    "node_modules/@emnapi/runtime": {
++      "version": "2.0.0-alpha.3",
++      "resolved": "https://registry.npmjs.org/@emnapi/runtime/-/runtime-2.0.0-alpha.3.tgz",
++      "integrity": "sha512-hFPAhMUjJD9BSyCANEISPOogeXC9Zo9ZQl7L6vKnaVsMkCtzznaW/naYypeyl0Gv5rYfWYsZbpixTMpjDJzQeA==",
+       "dev": true,
+       "license": "MIT",
+       "optional": true,
+-      "os": [
+-        "win32"
+-      ],
+-      "engines": {
+-        "node": ">=12"
++      "peer": true,
++      "dependencies": {
++        "tslib": "^2.4.0"
+       }
+     },
+-    "node_modules/@esbuild/win32-x64": {
+-      "version": "0.21.5",
+-      "resolved": "https://registry.npmjs.org/@esbuild/win32-x64/-/win32-x64-0.21.5.tgz",
+-      "integrity": "sha512-tQd/1efJuzPC6rCFwEvLtci/xNFcTZknmXs98FYDfGE4wP9ClFV98nyKrzJKVPMhdDnjzLhdUyMX4PsQAPjwIw==",
+-      "cpu": [
+-        "x64"
+-      ],
++    "node_modules/@emnapi/wasi-threads": {
++      "version": "2.0.1",
++      "resolved": "https://registry.npmjs.org/@emnapi/wasi-threads/-/wasi-threads-2.0.1.tgz",
++      "integrity": "sha512-9DsSk+o5NBX0CCJT8s0EROGSGxjR/tKu6aBTaVyq+SjAEQH4XcdcRxPBRzsBLizTTJ49MJjF+jgu3qnO9GLQcQ==",
+       "dev": true,
+       "license": "MIT",
+       "optional": true,
+-      "os": [
+-        "win32"
+-      ],
+-      "engines": {
+-        "node": ">=12"
++      "peer": true,
++      "dependencies": {
++        "tslib": "^2.4.0"
+       }
+     },
+     "node_modules/@jridgewell/gen-mapping": {
+@@ -729,17 +93,6 @@
+         "@jridgewell/trace-mapping": "^0.3.24"
+       }
+     },
+-    "node_modules/@jridgewell/remapping": {
+-      "version": "2.3.5",
+-      "resolved": "https://registry.npmjs.org/@jridgewell/remapping/-/remapping-2.3.5.tgz",
+-      "integrity": "sha512-LI9u/+laYG4Ds1TDKSJW2YPrIlcVYOwi2fUC6xB43lueCjgxV4lffOCZCtYFiH6TNOX+tQKXx97T4IKHbhyHEQ==",
+-      "dev": true,
+-      "license": "MIT",
+-      "dependencies": {
+-        "@jridgewell/gen-mapping": "^0.3.5",
+-        "@jridgewell/trace-mapping": "^0.3.24"
+-      }
+-    },
+     "node_modules/@jridgewell/resolve-uri": {
+       "version": "3.1.2",
+       "resolved": "https://registry.npmjs.org/@jridgewell/resolve-uri/-/resolve-uri-3.1.2.tgz",
+@@ -768,6 +121,28 @@
+         "@jridgewell/sourcemap-codec": "^1.4.14"
+       }
+     },
++    "node_modules/@napi-rs/wasm-runtime": {
++      "version": "1.2.0",
++      "resolved": "https://registry.npmjs.org/@napi-rs/wasm-runtime/-/wasm-runtime-1.2.0.tgz",
++      "integrity": "sha512-kDoONqMa+VnZ4vvvu/ZUurpJ4gkZU57e7g69qpNgWhYcZFPUHZM2CEMKm+cG6ufDVALbjMvfmMjFVqaK7uEMnA==",
++      "dev": true,
++      "license": "MIT",
++      "optional": true,
++      "dependencies": {
++        "@tybys/wasm-util": "^0.10.3"
++      },
++      "engines": {
++        "node": "^20.19.0 || ^22.13.0 || >=23.5.0"
++      },
++      "funding": {
++        "type": "github",
++        "url": "https://github.com/sponsors/Brooooooklyn"
++      },
++      "peerDependencies": {
++        "@emnapi/core": "^2.0.0-alpha.3",
++        "@emnapi/runtime": "^2.0.0-alpha.3"
++      }
++    },
+     "node_modules/@nodelib/fs.scandir": {
+       "version": "2.1.5",
+       "resolved": "https://registry.npmjs.org/@nodelib/fs.scandir/-/fs.scandir-2.1.5.tgz",
+@@ -806,31 +181,20 @@
+         "node": ">= 8"
+       }
+     },
+-    "node_modules/@rolldown/pluginutils": {
+-      "version": "1.0.0-beta.27",
+-      "resolved": "https://registry.npmjs.org/@rolldown/pluginutils/-/pluginutils-1.0.0-beta.27.tgz",
+-      "integrity": "sha512-+d0F4MKMCbeVUJwG96uQ4SgAznZNSq93I3V+9NHA4OpvqG8mRCpGdKmK8l/dl02h2CCDHwW2FqilnTyDcAnqjA==",
+-      "dev": true,
+-      "license": "MIT"
+-    },
+-    "node_modules/@rollup/rollup-android-arm-eabi": {
+-      "version": "4.62.3",
+-      "resolved": "https://registry.npmjs.org/@rollup/rollup-android-arm-eabi/-/rollup-android-arm-eabi-4.62.3.tgz",
+-      "integrity": "sha512-c0wdcekXtQvvn5Tsrk/+op/gUArrbWaFduBnTLP2l1cKLSQs4diMWjJw3m6A0DdzT8dAAX95KpkJ3qynCePbmw==",
+-      "cpu": [
+-        "arm"
+-      ],
++    "node_modules/@oxc-project/types": {
++      "version": "0.139.0",
++      "resolved": "https://registry.npmjs.org/@oxc-project/types/-/types-0.139.0.tgz",
++      "integrity": "sha512-r9gHphtCs+1M7J0pw6Sn/hh/Wpa/iQrOOkrNAlVLF/gHq+/CJmHIWKKUUhdWjcD6CIa8idarspCsASiXCXvFUw==",
+       "dev": true,
+       "license": "MIT",
+-      "optional": true,
+-      "os": [
+-        "android"
+-      ]
++      "funding": {
++        "url": "https://github.com/sponsors/Boshen"
++      }
+     },
+-    "node_modules/@rollup/rollup-android-arm64": {
+-      "version": "4.62.3",
+-      "resolved": "https://registry.npmjs.org/@rollup/rollup-android-arm64/-/rollup-android-arm64-4.62.3.tgz",
+-      "integrity": "sha512-3YjElDdWN+qXAFbJ/CzPV+0wspLqh54k/I6GfdYtEJRqg7buSgc1yPM3B+93j1M4neobtkATHZTmxK2AMVGfnA==",
++    "node_modules/@rolldown/binding-android-arm64": {
++      "version": "1.1.5",
++      "resolved": "https://registry.npmjs.org/@rolldown/binding-android-arm64/-/binding-android-arm64-1.1.5.tgz",
++      "integrity": "sha512-lZg8fqIv2v7FF237bwMgzGZEJvGL79/s5knJ/i6FmsGF4XXlzccZ4jb+TrFIxtSSxFtIpdsgrPZeMk1I9AFcyQ==",
+       "cpu": [
+         "arm64"
+       ],
+@@ -839,12 +203,15 @@
+       "optional": true,
+       "os": [
+         "android"
+-      ]
++      ],
++      "engines": {
++        "node": "^20.19.0 || >=22.12.0"
++      }
+     },
+-    "node_modules/@rollup/rollup-darwin-arm64": {
+-      "version": "4.62.3",
+-      "resolved": "https://registry.npmjs.org/@rollup/rollup-darwin-arm64/-/rollup-darwin-arm64-4.62.3.tgz",
+-      "integrity": "sha512-Pch2pFNOxxz1hTjypIdPyRTR6riiwRl84+VcN9djS680fw+Co1nAJINrdpqp7KV0NvyuU8ilZXZCjd7ykJl1GQ==",
++    "node_modules/@rolldown/binding-darwin-arm64": {
++      "version": "1.1.5",
++      "resolved": "https://registry.npmjs.org/@rolldown/binding-darwin-arm64/-/binding-darwin-arm64-1.1.5.tgz",
++      "integrity": "sha512-51Bnx9pNiMRKSUNtBfySkNJ9vMU9Hh3I1ozDd6gyPPYzaXCfnptUcEZxXGYFn+ul2dtcMUiqGR1Yai2K10uoTw==",
+       "cpu": [
+         "arm64"
+       ],
+@@ -853,12 +220,15 @@
+       "optional": true,
+       "os": [
+         "darwin"
+-      ]
++      ],
++      "engines": {
++        "node": "^20.19.0 || >=22.12.0"
++      }
+     },
+-    "node_modules/@rollup/rollup-darwin-x64": {
+-      "version": "4.62.3",
+-      "resolved": "https://registry.npmjs.org/@rollup/rollup-darwin-x64/-/rollup-darwin-x64-4.62.3.tgz",
+-      "integrity": "sha512-LEuncFUHFiF8t4yZVZvvZA1wk0pjAscRnsrn1EfTEmN4HXotBi2YtcnLRyaK6UbuczW7xZS5ES+81Rdz8Z0T6g==",
++    "node_modules/@rolldown/binding-darwin-x64": {
++      "version": "1.1.5",
++      "resolved": "https://registry.npmjs.org/@rolldown/binding-darwin-x64/-/binding-darwin-x64-1.1.5.tgz",
++      "integrity": "sha512-Tm+gbfC0aHu1tBA/JvKQh32S0K6YgCHkiAF4/W6xX0K0RmNuc94VeK419dJoE65R5aRxmo+noZQSWrAMF6yb6g==",
+       "cpu": [
+         "x64"
+       ],
+@@ -867,26 +237,15 @@
+       "optional": true,
+       "os": [
+         "darwin"
+-      ]
+-    },
+-    "node_modules/@rollup/rollup-freebsd-arm64": {
+-      "version": "4.62.3",
+-      "resolved": "https://registry.npmjs.org/@rollup/rollup-freebsd-arm64/-/rollup-freebsd-arm64-4.62.3.tgz",
+-      "integrity": "sha512-zvBUvsQUpOWALdDsk6qbS8bXf2VxmPisuudNDrY7x0p0jBdsoZl8HsHczIOgkQiZldmcacMKtBzpoGVNeIe2bQ==",
+-      "cpu": [
+-        "arm64"
+       ],
+-      "dev": true,
+-      "license": "MIT",
+-      "optional": true,
+-      "os": [
+-        "freebsd"
+-      ]
++      "engines": {
++        "node": "^20.19.0 || >=22.12.0"
++      }
+     },
+-    "node_modules/@rollup/rollup-freebsd-x64": {
+-      "version": "4.62.3",
+-      "resolved": "https://registry.npmjs.org/@rollup/rollup-freebsd-x64/-/rollup-freebsd-x64-4.62.3.tgz",
+-      "integrity": "sha512-C2KmNrcSem/AMg984H/dev+si0lieQGdXdR/lYGJnuumXnFb9Y7QdiI62obFdLlxRYLBv4P0eUVIDbD4c1vVvw==",
++    "node_modules/@rolldown/binding-freebsd-x64": {
++      "version": "1.1.5",
++      "resolved": "https://registry.npmjs.org/@rolldown/binding-freebsd-x64/-/binding-freebsd-x64-1.1.5.tgz",
++      "integrity": "sha512-JMzDKCCXq93YccG5gz3hvOs1oXRKAf0XYpfOS88e+wZrC8Iugj6j68867vrYZkvpDDpKn/KoKORThmchMpF6TA==",
+       "cpu": [
+         "x64"
+       ],
+@@ -895,26 +254,15 @@
+       "optional": true,
+       "os": [
+         "freebsd"
+-      ]
+-    },
+-    "node_modules/@rollup/rollup-linux-arm-gnueabihf": {
+-      "version": "4.62.3",
+-      "resolved": "https://registry.npmjs.org/@rollup/rollup-linux-arm-gnueabihf/-/rollup-linux-arm-gnueabihf-4.62.3.tgz",
+-      "integrity": "sha512-ggXnsTAEzNQx74XpunRsiZ9aBZDsI7XIa0hm2nzR9f4WzH5/f/d73ZSDaC5ejJ8YLY4NW+V3wr0tjOaeCq8hqA==",
+-      "cpu": [
+-        "arm"
+       ],
+-      "dev": true,
+-      "license": "MIT",
+-      "optional": true,
+-      "os": [
+-        "linux"
+-      ]
++      "engines": {
++        "node": "^20.19.0 || >=22.12.0"
++      }
+     },
+-    "node_modules/@rollup/rollup-linux-arm-musleabihf": {
+-      "version": "4.62.3",
+-      "resolved": "https://registry.npmjs.org/@rollup/rollup-linux-arm-musleabihf/-/rollup-linux-arm-musleabihf-4.62.3.tgz",
+-      "integrity": "sha512-2vng+FlzNUhKZxtej3IUqJgbZoQk2M/dwQM20+ULV0R/E/8tr9/P6uEf2iiGIk4HL0zMKh5Jry7mUHdUOvyGgA==",
++    "node_modules/@rolldown/binding-linux-arm-gnueabihf": {
++      "version": "1.1.5",
++      "resolved": "https://registry.npmjs.org/@rolldown/binding-linux-arm-gnueabihf/-/binding-linux-arm-gnueabihf-1.1.5.tgz",
++      "integrity": "sha512-uML21j2K5TfPGutKxub+M+nLjZIrWjXQ5Grx4lCe/nimTj9B4L63zHpjXLl4y0L3mcm2htEQIb06oCG/szerNw==",
+       "cpu": [
+         "arm"
+       ],
+@@ -923,26 +271,15 @@
+       "optional": true,
+       "os": [
+         "linux"
+-      ]
+-    },
+-    "node_modules/@rollup/rollup-linux-arm64-gnu": {
+-      "version": "4.62.3",
+-      "resolved": "https://registry.npmjs.org/@rollup/rollup-linux-arm64-gnu/-/rollup-linux-arm64-gnu-4.62.3.tgz",
+-      "integrity": "sha512-LLLFZKt4/Nraf9rxDkhiU8QVgLF4WmCkfr0L4fj0fPfIZFBib0DeiFk1hhaYKd03LFAFJcxHslhDFlNJLylf5Q==",
+-      "cpu": [
+-        "arm64"
+       ],
+-      "dev": true,
+-      "license": "MIT",
+-      "optional": true,
+-      "os": [
+-        "linux"
+-      ]
++      "engines": {
++        "node": "^20.19.0 || >=22.12.0"
++      }
+     },
+-    "node_modules/@rollup/rollup-linux-arm64-musl": {
+-      "version": "4.62.3",
+-      "resolved": "https://registry.npmjs.org/@rollup/rollup-linux-arm64-musl/-/rollup-linux-arm64-musl-4.62.3.tgz",
+-      "integrity": "sha512-WJkdQCvS9sWNOUBJZfQRKpZGFBztRzcowI+nndmflKgU4XY+3a420FgTOSKTsVqJbnzSxeT4vaJalpOaPo2YCQ==",
++    "node_modules/@rolldown/binding-linux-arm64-gnu": {
++      "version": "1.1.5",
++      "resolved": "https://registry.npmjs.org/@rolldown/binding-linux-arm64-gnu/-/binding-linux-arm64-gnu-1.1.5.tgz",
++      "integrity": "sha512-navSiuTMogvnQoZoM/v+l3ZWo50/NTwSHSzheABx/RCnmUPaKwq9qSo4Br2OYRs21+Fz8uFqITZM3H4opOB0/Q==",
+       "cpu": [
+         "arm64"
+       ],
+@@ -951,54 +288,32 @@
+       "optional": true,
+       "os": [
+         "linux"
+-      ]
+-    },
+-    "node_modules/@rollup/rollup-linux-loong64-gnu": {
+-      "version": "4.62.3",
+-      "resolved": "https://registry.npmjs.org/@rollup/rollup-linux-loong64-gnu/-/rollup-linux-loong64-gnu-4.62.3.tgz",
+-      "integrity": "sha512-PwHXCCS2n64/1Ot6rP1YEYA02MGYBcQlr8CSZZyrUG2O7NH6NklYmvr9v3Jy+5e/eDeNchc/ukmKJi9LuflMIQ==",
+-      "cpu": [
+-        "loong64"
+       ],
+-      "dev": true,
+-      "license": "MIT",
+-      "optional": true,
+-      "os": [
+-        "linux"
+-      ]
++      "engines": {
++        "node": "^20.19.0 || >=22.12.0"
++      }
+     },
+-    "node_modules/@rollup/rollup-linux-loong64-musl": {
+-      "version": "4.62.3",
+-      "resolved": "https://registry.npmjs.org/@rollup/rollup-linux-loong64-musl/-/rollup-linux-loong64-musl-4.62.3.tgz",
+-      "integrity": "sha512-vUjxINQu3RC8NZS3ykk1gN65gIz8pAopOq2HXuZhiIxHdx7TFvDG+jgrdSgInu1Eza4/Rfi2VzZgyIgEH4WOaw==",
++    "node_modules/@rolldown/binding-linux-arm64-musl": {
++      "version": "1.1.5",
++      "resolved": "https://registry.npmjs.org/@rolldown/binding-linux-arm64-musl/-/binding-linux-arm64-musl-1.1.5.tgz",
++      "integrity": "sha512-lAryqH7IteztmCXQXk0etKj4wBQ7Gx5S6LjKhsgp9zb8I5bsuvU/2llH1hDQcjsFeqIsovMVN339/8pUDDBXxA==",
+       "cpu": [
+-        "loong64"
++        "arm64"
+       ],
+       "dev": true,
+       "license": "MIT",
+       "optional": true,
+       "os": [
+         "linux"
+-      ]
+-    },
+-    "node_modules/@rollup/rollup-linux-ppc64-gnu": {
+-      "version": "4.62.3",
+-      "resolved": "https://registry.npmjs.org/@rollup/rollup-linux-ppc64-gnu/-/rollup-linux-ppc64-gnu-4.62.3.tgz",
+-      "integrity": "sha512-wzko4aJ13+0G3kGnviCg5gnXFKd40izKsrf2uOw12US4XqprkDrmwOpeW14aSNa37V8bfPcz5Fkob6LZ3BAPmA==",
+-      "cpu": [
+-        "ppc64"
+       ],
+-      "dev": true,
+-      "license": "MIT",
+-      "optional": true,
+-      "os": [
+-        "linux"
+-      ]
++      "engines": {
++        "node": "^20.19.0 || >=22.12.0"
++      }
+     },
+-    "node_modules/@rollup/rollup-linux-ppc64-musl": {
+-      "version": "4.62.3",
+-      "resolved": "https://registry.npmjs.org/@rollup/rollup-linux-ppc64-musl/-/rollup-linux-ppc64-musl-4.62.3.tgz",
+-      "integrity": "sha512-8120ue0JUMSwy11stlwnfdX3pPd+WZYGCDBwEHWtIHi6pOpZmsEF5QKB7a/UN+XFdqvobxz98kv8RTqikyCEBw==",
++    "node_modules/@rolldown/binding-linux-ppc64-gnu": {
++      "version": "1.1.5",
++      "resolved": "https://registry.npmjs.org/@rolldown/binding-linux-ppc64-gnu/-/binding-linux-ppc64-gnu-1.1.5.tgz",
++      "integrity": "sha512-fsK/sNBnxzBlL4O1JNrZakVQxPspqpED5dLtNsZS9oOKmtSpdNIzxH2kkol5HYTWJN47sE20ztMJPxfZ89qGOg==",
+       "cpu": [
+         "ppc64"
+       ],
+@@ -1007,54 +322,49 @@
+       "optional": true,
+       "os": [
+         "linux"
+-      ]
+-    },
+-    "node_modules/@rollup/rollup-linux-riscv64-gnu": {
+-      "version": "4.62.3",
+-      "resolved": "https://registry.npmjs.org/@rollup/rollup-linux-riscv64-gnu/-/rollup-linux-riscv64-gnu-4.62.3.tgz",
+-      "integrity": "sha512-XLFHnR3tXMjbOCh2vtVJHmxt+995uJsTERQyseFDRA0xxMxyTZPLa3OIUlyFaO4mF/Lu0FjmWHCuPXJT1n/IOg==",
+-      "cpu": [
+-        "riscv64"
+       ],
+-      "dev": true,
+-      "license": "MIT",
+-      "optional": true,
+-      "os": [
+-        "linux"
+-      ]
++      "engines": {
++        "node": "^20.19.0 || >=22.12.0"
++      }
+     },
+-    "node_modules/@rollup/rollup-linux-riscv64-musl": {
+-      "version": "4.62.3",
+-      "resolved": "https://registry.npmjs.org/@rollup/rollup-linux-riscv64-musl/-/rollup-linux-riscv64-musl-4.62.3.tgz",
+-      "integrity": "sha512-se6yXvNGMIl0f+RQzyh7XAmia8/9kplQx424wnG2w0C1oi6XgO6Y8otKhdXFHbHs88Ihavzmvh1NWjuovE76BQ==",
++    "node_modules/@rolldown/binding-linux-s390x-gnu": {
++      "version": "1.1.5",
++      "resolved": "https://registry.npmjs.org/@rolldown/binding-linux-s390x-gnu/-/binding-linux-s390x-gnu-1.1.5.tgz",
++      "integrity": "sha512-gLYb4BIadlfTOYT5gO503n8zQjXflgzpD0FcyKh0Mzx3rqCZKnHoJWV9xe1KXUJ5lx2JfcSHr/mhzS0PC/McAA==",
+       "cpu": [
+-        "riscv64"
++        "s390x"
+       ],
+       "dev": true,
+       "license": "MIT",
+       "optional": true,
+       "os": [
+         "linux"
+-      ]
++      ],
++      "engines": {
++        "node": "^20.19.0 || >=22.12.0"
++      }
+     },
+-    "node_modules/@rollup/rollup-linux-s390x-gnu": {
+-      "version": "4.62.3",
+-      "resolved": "https://registry.npmjs.org/@rollup/rollup-linux-s390x-gnu/-/rollup-linux-s390x-gnu-4.62.3.tgz",
+-      "integrity": "sha512-gNoxRefktVIiGflpONuxWWXZAzIQG++z9qHO3xKwk4WdDMuQja3JHGfE1u0i3PfPDyvhypdk+WrgIJqLhGG7sg==",
++    "node_modules/@rolldown/binding-linux-x64-gnu": {
++      "version": "1.1.5",
++      "resolved": "https://registry.npmjs.org/@rolldown/binding-linux-x64-gnu/-/binding-linux-x64-gnu-1.1.5.tgz",
++      "integrity": "sha512-FjcpEKUyJygHgs1o50VYNvkt5+7Le/VEdYt0AkRpkL33MnyQfwr8l5mXwMmfmTbyMPr5vJLC+8/Gd9gXnwU1QQ==",
+       "cpu": [
+-        "s390x"
++        "x64"
+       ],
+       "dev": true,
+       "license": "MIT",
+       "optional": true,
+       "os": [
+         "linux"
+-      ]
++      ],
++      "engines": {
++        "node": "^20.19.0 || >=22.12.0"
++      }
+     },
+-    "node_modules/@rollup/rollup-linux-x64-gnu": {
+-      "version": "4.62.3",
+-      "resolved": "https://registry.npmjs.org/@rollup/rollup-linux-x64-gnu/-/rollup-linux-x64-gnu-4.62.3.tgz",
+-      "integrity": "sha512-V4KtWtQfAFMU7+9/A/VDps/VI8CHd3cYz0L8sgJzz8qK7eY7wI4ruFD82UYIYvW9Z4DtlTfhQcsl4XyPHW5uSg==",
++    "node_modules/@rolldown/binding-linux-x64-musl": {
++      "version": "1.1.5",
++      "resolved": "https://registry.npmjs.org/@rolldown/binding-linux-x64-musl/-/binding-linux-x64-musl-1.1.5.tgz",
++      "integrity": "sha512-Me+PfPI2TMeOQk0gYWfLQZtTktrmzbr8cDboqX83XKc7UrgAi55gF+2dUkWdxd19n55Essp2yeca+O9N5rBxHg==",
+       "cpu": [
+         "x64"
+       ],
+@@ -1063,96 +373,102 @@
+       "optional": true,
+       "os": [
+         "linux"
+-      ]
++      ],
++      "engines": {
++        "node": "^20.19.0 || >=22.12.0"
++      }
+     },
+-    "node_modules/@rollup/rollup-linux-x64-musl": {
+-      "version": "4.62.3",
+-      "resolved": "https://registry.npmjs.org/@rollup/rollup-linux-x64-musl/-/rollup-linux-x64-musl-4.62.3.tgz",
+-      "integrity": "sha512-LBx9LYXvj2CBkMkjLdNAWLwH0MLMin7do2VcVo9kVPibGLkY0BQQut2fv7NVqkXqZ/CrAu9LqDHVV1xHCMpCPw==",
++    "node_modules/@rolldown/binding-openharmony-arm64": {
++      "version": "1.1.5",
++      "resolved": "https://registry.npmjs.org/@rolldown/binding-openharmony-arm64/-/binding-openharmony-arm64-1.1.5.tgz",
++      "integrity": "sha512-yc5WrLzXks6zCQfn9Oxr8pORKyl/pF+QjHmW/Qx3qu0oyrrNC+y2JLTU1E2rcWYAmzlnqngWXHQjy51VzW70Vw==",
+       "cpu": [
+-        "x64"
++        "arm64"
+       ],
+       "dev": true,
+       "license": "MIT",
+       "optional": true,
+       "os": [
+-        "linux"
+-      ]
++        "openharmony"
++      ],
++      "engines": {
++        "node": "^20.19.0 || >=22.12.0"
++      }
+     },
+-    "node_modules/@rollup/rollup-openbsd-x64": {
+-      "version": "4.62.3",
+-      "resolved": "https://registry.npmjs.org/@rollup/rollup-openbsd-x64/-/rollup-openbsd-x64-4.62.3.tgz",
+-      "integrity": "sha512-ABVf3Q0RCu7NcyCCOZQI0pJ3GuSdfSl8EXcy88QtdceIMIoCUdfhsJChZ64L9zVM2aJHjde1Bhn5uqSRcX9ySA==",
++    "node_modules/@rolldown/binding-wasm32-wasi": {
++      "version": "1.1.5",
++      "resolved": "https://registry.npmjs.org/@rolldown/binding-wasm32-wasi/-/binding-wasm32-wasi-1.1.5.tgz",
++      "integrity": "sha512-VbQGPX2b4r48TAMIM2cjgluIM1HYutm4pcTEJsle7iEP7sB1dFqtPLBVbdLAZCxy1txCcPxf4QFf4v8uvltPqA==",
+       "cpu": [
+-        "x64"
++        "wasm32"
+       ],
+       "dev": true,
+       "license": "MIT",
+       "optional": true,
+-      "os": [
+-        "openbsd"
+-      ]
++      "dependencies": {
++        "@emnapi/core": "1.11.1",
++        "@emnapi/runtime": "1.11.1",
++        "@napi-rs/wasm-runtime": "^1.1.6"
++      },
++      "engines": {
++        "node": "^20.19.0 || >=22.12.0"
++      }
+     },
+-    "node_modules/@rollup/rollup-openharmony-arm64": {
+-      "version": "4.62.3",
+-      "resolved": "https://registry.npmjs.org/@rollup/rollup-openharmony-arm64/-/rollup-openharmony-arm64-4.62.3.tgz",
+-      "integrity": "sha512-+2Cy/ldweGBLlPIKsQLF8U5N44a0KDdbrk1rAjHOM9M2K+kGdIVjHLmmrZIcx+9Ny3ke/1JomCsDI1ocb11+sg==",
+-      "cpu": [
+-        "arm64"
+-      ],
++    "node_modules/@rolldown/binding-wasm32-wasi/node_modules/@emnapi/core": {
++      "version": "1.11.1",
++      "resolved": "https://registry.npmjs.org/@emnapi/core/-/core-1.11.1.tgz",
++      "integrity": "sha512-RSvbQmHzdKzNsLYa/wHrbc3KN4sYLKAdPZxqiM2HATqv/SBk2/ENSHpvXGaLOMcsAyz0poEGqkmmKYG3OWiJEQ==",
+       "dev": true,
+       "license": "MIT",
+       "optional": true,
+-      "os": [
+-        "openharmony"
+-      ]
++      "dependencies": {
++        "@emnapi/wasi-threads": "1.2.2",
++        "tslib": "^2.4.0"
++      }
+     },
+-    "node_modules/@rollup/rollup-win32-arm64-msvc": {
+-      "version": "4.62.3",
+-      "resolved": "https://registry.npmjs.org/@rollup/rollup-win32-arm64-msvc/-/rollup-win32-arm64-msvc-4.62.3.tgz",
+-      "integrity": "sha512-dtZvzc8BedpSaFNy75x6uiWwAGTH+aZHDtdrqP6qk+WcLJrfti6sGje1ZJ9UxyzDLF23d/mV+PaMwuC0hL7UVA==",
+-      "cpu": [
+-        "arm64"
+-      ],
++    "node_modules/@rolldown/binding-wasm32-wasi/node_modules/@emnapi/runtime": {
++      "version": "1.11.1",
++      "resolved": "https://registry.npmjs.org/@emnapi/runtime/-/runtime-1.11.1.tgz",
++      "integrity": "sha512-vgj7R3y3Wgx24IQaGPA/R6YFXLHVMOZ0uVEyIQPaWs+rd1AzfEMXlAC22FYwO1XkKR6NPsq7mUandH8oIRdZFw==",
+       "dev": true,
+       "license": "MIT",
+       "optional": true,
+-      "os": [
+-        "win32"
+-      ]
++      "dependencies": {
++        "tslib": "^2.4.0"
++      }
+     },
+-    "node_modules/@rollup/rollup-win32-ia32-msvc": {
+-      "version": "4.62.3",
+-      "resolved": "https://registry.npmjs.org/@rollup/rollup-win32-ia32-msvc/-/rollup-win32-ia32-msvc-4.62.3.tgz",
+-      "integrity": "sha512-Rj8Ra4noo+aYy7sKBggCx0407mws34kAb1ySyWuq5DAtFBQdkSwnsjCgPrhPe9cvgBKZIukpE+CVHvORCS93kQ==",
+-      "cpu": [
+-        "ia32"
+-      ],
++    "node_modules/@rolldown/binding-wasm32-wasi/node_modules/@emnapi/wasi-threads": {
++      "version": "1.2.2",
++      "resolved": "https://registry.npmjs.org/@emnapi/wasi-threads/-/wasi-threads-1.2.2.tgz",
++      "integrity": "sha512-c95qOXkHdydNKhscBTebqEC1CVAZpyqOfVfBzQ1qgzyl3gfeldUjIggDbIZgDKsHLgnsM+igH7TJ/eAasaVuMA==",
+       "dev": true,
+       "license": "MIT",
+       "optional": true,
+-      "os": [
+-        "win32"
+-      ]
++      "dependencies": {
++        "tslib": "^2.4.0"
++      }
+     },
+-    "node_modules/@rollup/rollup-win32-x64-gnu": {
+-      "version": "4.62.3",
+-      "resolved": "https://registry.npmjs.org/@rollup/rollup-win32-x64-gnu/-/rollup-win32-x64-gnu-4.62.3.tgz",
+-      "integrity": "sha512-vp7N084ew/odXn2gi/mzm9mUkQu9l6AiN6dt4IeUM2Uvm9o+cVmP+YkqbMOteLbiGgqBBlJZjIMYVCfOOIVbVQ==",
++    "node_modules/@rolldown/binding-win32-arm64-msvc": {
++      "version": "1.1.5",
++      "resolved": "https://registry.npmjs.org/@rolldown/binding-win32-arm64-msvc/-/binding-win32-arm64-msvc-1.1.5.tgz",
++      "integrity": "sha512-gHv82k63z4qpV5+Q1y/12KrK0ltWBukVDI8nZcbT7Tt/ZlOIVwppazneq0F93oDxTo3IgAMEDIoQh3E2n6mVsw==",
+       "cpu": [
+-        "x64"
++        "arm64"
+       ],
+       "dev": true,
+       "license": "MIT",
+       "optional": true,
+       "os": [
+         "win32"
+-      ]
++      ],
++      "engines": {
++        "node": "^20.19.0 || >=22.12.0"
++      }
+     },
+-    "node_modules/@rollup/rollup-win32-x64-msvc": {
+-      "version": "4.62.3",
+-      "resolved": "https://registry.npmjs.org/@rollup/rollup-win32-x64-msvc/-/rollup-win32-x64-msvc-4.62.3.tgz",
+-      "integrity": "sha512-MOG/3gTOn4Fwf574RVOaY61I5o6P90legkFADiTyn1hyjNydT+cerU2rLUwPdZkKKyJ+iT+K9p7WXK4LM1Ka6g==",
++    "node_modules/@rolldown/binding-win32-x64-msvc": {
++      "version": "1.1.5",
++      "resolved": "https://registry.npmjs.org/@rolldown/binding-win32-x64-msvc/-/binding-win32-x64-msvc-1.1.5.tgz",
++      "integrity": "sha512-tTZuDBPw85tEN5PQi1pnEBzDy0Z49HtScLAbD5t6hyeU92A95pRWaSMw1GZZi/RwgSgUIl0xrSlXIT/9QzvYSA==",
+       "cpu": [
+         "x64"
+       ],
+@@ -1161,58 +477,33 @@
+       "optional": true,
+       "os": [
+         "win32"
+-      ]
+-    },
+-    "node_modules/@types/babel__core": {
+-      "version": "7.20.5",
+-      "resolved": "https://registry.npmjs.org/@types/babel__core/-/babel__core-7.20.5.tgz",
+-      "integrity": "sha512-qoQprZvz5wQFJwMDqeseRXWv3rqMvhgpbXFfVyWhbx9X47POIA6i/+dXefEmZKoAgOaTdaIgNSMqMIU61yRyzA==",
+-      "dev": true,
+-      "license": "MIT",
+-      "dependencies": {
+-        "@babel/parser": "^7.20.7",
+-        "@babel/types": "^7.20.7",
+-        "@types/babel__generator": "*",
+-        "@types/babel__template": "*",
+-        "@types/babel__traverse": "*"
+-      }
+-    },
+-    "node_modules/@types/babel__generator": {
+-      "version": "7.27.0",
+-      "resolved": "https://registry.npmjs.org/@types/babel__generator/-/babel__generator-7.27.0.tgz",
+-      "integrity": "sha512-ufFd2Xi92OAVPYsy+P4n7/U7e68fex0+Ee8gSG9KX7eo084CWiQ4sdxktvdl0bOPupXtVJPY19zk6EwWqUQ8lg==",
+-      "dev": true,
+-      "license": "MIT",
+-      "dependencies": {
+-        "@babel/types": "^7.0.0"
++      ],
++      "engines": {
++        "node": "^20.19.0 || >=22.12.0"
+       }
+     },
+-    "node_modules/@types/babel__template": {
+-      "version": "7.4.4",
+-      "resolved": "https://registry.npmjs.org/@types/babel__template/-/babel__template-7.4.4.tgz",
+-      "integrity": "sha512-h/NUaSyG5EyxBIp8YRxo4RMe2/qQgvyowRwVMzhYhBCONbW8PUsg4lkFMrhgZhUe5z3L3MiLDuvyJ/CaPa2A8A==",
++    "node_modules/@rolldown/pluginutils": {
++      "version": "1.0.1",
++      "resolved": "https://registry.npmjs.org/@rolldown/pluginutils/-/pluginutils-1.0.1.tgz",
++      "integrity": "sha512-2j9bGt5Jh8hj+vPtgzPtl72j0yRxHAyumoo6TNfAjsLB04UtpSvPbPcDcBMxz7n+9CYB0c1GxQFxYRg2jimqGw==",
+       "dev": true,
+-      "license": "MIT",
+-      "dependencies": {
+-        "@babel/parser": "^7.1.0",
+-        "@babel/types": "^7.0.0"
+-      }
++      "license": "MIT"
+     },
+-    "node_modules/@types/babel__traverse": {
+-      "version": "7.28.0",
+-      "resolved": "https://registry.npmjs.org/@types/babel__traverse/-/babel__traverse-7.28.0.tgz",
+-      "integrity": "sha512-8PvcXf70gTDZBgt9ptxJ8elBeBjcLOAcOtoO/mPJjtji1+CdGbHgm77om1GrsPxsiE+uXIpNSK64UYaIwQXd4Q==",
++    "node_modules/@tybys/wasm-util": {
++      "version": "0.10.3",
++      "resolved": "https://registry.npmjs.org/@tybys/wasm-util/-/wasm-util-0.10.3.tgz",
++      "integrity": "sha512-F3fo1MYrRJYL3zER0OUOmkutjr1Vp23m7OsSgp7nq4SP6OqX6C/56XFIPAl5bt3zaBRjmW7SGz3u/6LwFpYcOg==",
+       "dev": true,
+       "license": "MIT",
++      "optional": true,
+       "dependencies": {
+-        "@babel/types": "^7.28.2"
++        "tslib": "^2.4.0"
+       }
+     },
+-    "node_modules/@types/estree": {
+-      "version": "1.0.9",
+-      "resolved": "https://registry.npmjs.org/@types/estree/-/estree-1.0.9.tgz",
+-      "integrity": "sha512-GhdPgy1el4/ImP05X05Uw4cw2/M93BCUmnEvWZNStlCzEKME4Fkk+YpoA5OiHNQmoS7Cafb8Xa3Pya8m1Qrzeg==",
+-      "dev": true,
++    "node_modules/@types/pako": {
++      "version": "2.0.4",
++      "resolved": "https://registry.npmjs.org/@types/pako/-/pako-2.0.4.tgz",
++      "integrity": "sha512-VWDCbrLeVXJM9fihYodcLiIv0ku+AlOa/TQ1SvYOaBuyrSKgEcro95LJyIsJ4vSo6BXIxOKxiJAat04CmST9Fw==",
+       "license": "MIT"
+     },
+     "node_modules/@types/prop-types": {
+@@ -1250,25 +541,37 @@
+         "@types/react": "^18.0.0"
+       }
+     },
++    "node_modules/@types/trusted-types": {
++      "version": "2.0.7",
++      "resolved": "https://registry.npmjs.org/@types/trusted-types/-/trusted-types-2.0.7.tgz",
++      "integrity": "sha512-ScaPdn1dQczgbl0QFTeTOmVHFULt394XJgOQNoyVhZ6r2vLnMLJfBPd53SB52T/3G36VI1/g2MZaX0cwDuXsfw==",
++      "license": "MIT",
++      "optional": true
++    },
+     "node_modules/@vitejs/plugin-react": {
+-      "version": "4.7.0",
+-      "resolved": "https://registry.npmjs.org/@vitejs/plugin-react/-/plugin-react-4.7.0.tgz",
+-      "integrity": "sha512-gUu9hwfWvvEDBBmgtAowQCojwZmJ5mcLn3aufeCsitijs3+f2NsrPtlAWIR6OPiqljl96GVCUbLe0HyqIpVaoA==",
++      "version": "6.0.4",
++      "resolved": "https://registry.npmjs.org/@vitejs/plugin-react/-/plugin-react-6.0.4.tgz",
++      "integrity": "sha512-XcCQz0TBpBgljhj0gMuuDj49i6Ytqh5q1osT/Gp5uAVJUCTWxyskk/l1jwYYiu2xcNHHipdMz40EGfM1VdamVg==",
+       "dev": true,
+       "license": "MIT",
+       "dependencies": {
+-        "@babel/core": "^7.28.0",
+-        "@babel/plugin-transform-react-jsx-self": "^7.27.1",
+-        "@babel/plugin-transform-react-jsx-source": "^7.27.1",
+-        "@rolldown/pluginutils": "1.0.0-beta.27",
+-        "@types/babel__core": "^7.20.5",
+-        "react-refresh": "^0.17.0"
++        "@rolldown/pluginutils": "^1.0.1"
+       },
+       "engines": {
+-        "node": "^14.18.0 || >=16.0.0"
++        "node": "^20.19.0 || >=22.12.0"
+       },
+       "peerDependencies": {
+-        "vite": "^4.2.0 || ^5.0.0 || ^6.0.0 || ^7.0.0"
++        "@rolldown/plugin-babel": "^0.1.7 || ^0.2.0",
++        "babel-plugin-react-compiler": "^1.0.0",
++        "vite": "^8.0.0"
++      },
++      "peerDependenciesMeta": {
++        "@rolldown/plugin-babel": {
++          "optional": true
++        },
++        "babel-plugin-react-compiler": {
++          "optional": true
++        }
+       }
+     },
+     "node_modules/any-promise": {
+@@ -1299,18 +602,6 @@
+       "dev": true,
+       "license": "MIT"
+     },
+-    "node_modules/atob": {
+-      "version": "2.1.2",
+-      "resolved": "https://registry.npmjs.org/atob/-/atob-2.1.2.tgz",
+-      "integrity": "sha512-Wm6ukoaOGJi/73p/cl2GvLjTI5JM1k/O14isD73YML8StrH/7/lRFgmg8nICZgD3bZZvjwCGxtMOD3wWNAu8cg==",
+-      "license": "(MIT OR Apache-2.0)",
+-      "bin": {
+-        "atob": "bin/atob.js"
+-      },
+-      "engines": {
+-        "node": ">= 4.5.0"
+-      }
+-    },
+     "node_modules/autoprefixer": {
+       "version": "10.5.4",
+       "resolved": "https://registry.npmjs.org/autoprefixer/-/autoprefixer-10.5.4.tgz",
+@@ -1359,9 +650,9 @@
+       }
+     },
+     "node_modules/baseline-browser-mapping": {
+-      "version": "2.11.4",
+-      "resolved": "https://registry.npmjs.org/baseline-browser-mapping/-/baseline-browser-mapping-2.11.4.tgz",
+-      "integrity": "sha512-s4+sLr9mZ/CyqeRritFeYV/Zx73OAtmaHn6kkBS1XRoJn1hrg3xIDUcpicAEX68tkcIN0iBCgti31C8zxtkhsQ==",
++      "version": "2.11.5",
++      "resolved": "https://registry.npmjs.org/baseline-browser-mapping/-/baseline-browser-mapping-2.11.5.tgz",
++      "integrity": "sha512-xJo6a6YZnwZfnyGmQKWMbVOcii7XRibjOskRh+WJ9UHQoX16xrQrcIgAMQOzfvs8XiLMx6ih/fsLPF73iY2D1A==",
+       "dev": true,
+       "license": "Apache-2.0",
+       "bin": {
+@@ -1431,18 +722,6 @@
+         "node": "^6 || ^7 || ^8 || ^9 || ^10 || ^11 || ^12 || >=13.7"
+       }
+     },
+-    "node_modules/btoa": {
+-      "version": "1.2.1",
+-      "resolved": "https://registry.npmjs.org/btoa/-/btoa-1.2.1.tgz",
+-      "integrity": "sha512-SB4/MIGlsiVkMcHmT+pSmIPoNDoHg+7cMzmt3Uxt628MTz2487DKSqK/fuhFBrkuqrYv5UCEnACpF4dTFNKc/g==",
+-      "license": "(MIT OR Apache-2.0)",
+-      "bin": {
+-        "btoa": "bin/btoa.js"
+-      },
+-      "engines": {
+-        "node": ">= 0.4.0"
+-      }
+-    },
+     "node_modules/camelcase-css": {
+       "version": "2.0.1",
+       "resolved": "https://registry.npmjs.org/camelcase-css/-/camelcase-css-2.0.1.tgz",
+@@ -1542,13 +821,6 @@
+         "node": ">= 6"
+       }
+     },
+-    "node_modules/convert-source-map": {
+-      "version": "2.0.0",
+-      "resolved": "https://registry.npmjs.org/convert-source-map/-/convert-source-map-2.0.0.tgz",
+-      "integrity": "sha512-Kvp459HrV2FEJ1CAsi1Ku+MY3kasH19TFykTz2xWmMeq6bk2NU3XXvfJ+Q61m0xktWwt+1HSYf3JZsTms3aRJg==",
+-      "dev": true,
+-      "license": "MIT"
+-    },
+     "node_modules/core-js": {
+       "version": "3.49.0",
+       "resolved": "https://registry.npmjs.org/core-js/-/core-js-3.49.0.tgz",
+@@ -1591,22 +863,14 @@
+       "dev": true,
+       "license": "MIT"
+     },
+-    "node_modules/debug": {
+-      "version": "4.4.3",
+-      "resolved": "https://registry.npmjs.org/debug/-/debug-4.4.3.tgz",
+-      "integrity": "sha512-RGwwWnwQvkVfavKVt22FGLw+xYSdzARwm0ru6DhTVA3umU5hZc28V3kO4stgYryrTlLpuvgI9GiijltAjNbcqA==",
++    "node_modules/detect-libc": {
++      "version": "2.1.2",
++      "resolved": "https://registry.npmjs.org/detect-libc/-/detect-libc-2.1.2.tgz",
++      "integrity": "sha512-Btj2BOOO83o3WyH59e8MgXsxEQVcarkUOpEYrubB0urwnN10yQ364rsiByU11nZlqWYZm05i/of7io4mzihBtQ==",
+       "dev": true,
+-      "license": "MIT",
+-      "dependencies": {
+-        "ms": "^2.1.3"
+-      },
++      "license": "Apache-2.0",
+       "engines": {
+-        "node": ">=6.0"
+-      },
+-      "peerDependenciesMeta": {
+-        "supports-color": {
+-          "optional": true
+-        }
++        "node": ">=8"
+       }
+     },
+     "node_modules/didyoumean": {
+@@ -1624,16 +888,19 @@
+       "license": "MIT"
+     },
+     "node_modules/dompurify": {
+-      "version": "2.5.9",
+-      "resolved": "https://registry.npmjs.org/dompurify/-/dompurify-2.5.9.tgz",
+-      "integrity": "sha512-i6mvVmWN4xo9LrhCOZrDgSs9noW6nOahbrmzjRbPF36YPyj5Ue5lgok0MHDWkG7xzpWFO2OYttXdzM7rJxHvNA==",
++      "version": "3.4.12",
++      "resolved": "https://registry.npmjs.org/dompurify/-/dompurify-3.4.12.tgz",
++      "integrity": "sha512-zQvGet8Z2sWbQhCmfFz/T5QWH2oBmjnqK3qvOjaqaNLrLEF912WamU+ohnTp0TCep/MFVHpdJuCZEdFOdTnEFg==",
+       "license": "(MPL-2.0 OR Apache-2.0)",
+-      "optional": true
++      "optional": true,
++      "optionalDependencies": {
++        "@types/trusted-types": "^2.0.7"
++      }
+     },
+     "node_modules/electron-to-chromium": {
+-      "version": "1.5.396",
+-      "resolved": "https://registry.npmjs.org/electron-to-chromium/-/electron-to-chromium-1.5.396.tgz",
+-      "integrity": "sha512-yHiw2Y3C3H9U6TMbOfoWK/BPreiOPXRfTWPBwQBoZG6/8TB6eOPnsy5oaRYuatR7Fw2SJ4kKforgufeo7fq0EQ==",
++      "version": "1.5.397",
++      "resolved": "https://registry.npmjs.org/electron-to-chromium/-/electron-to-chromium-1.5.397.tgz",
++      "integrity": "sha512-khGTy9U9x02KEtsKM8vx5A62BsRmcOsIgDpWr1ImE32Ax8GxHGPHZf+Eu9H8zOOyHJnB0jTbseyTHbq2XCT8yw==",
+       "dev": true,
+       "license": "ISC"
+     },
+@@ -1647,45 +914,6 @@
+         "node": ">= 0.4"
+       }
+     },
+-    "node_modules/esbuild": {
+-      "version": "0.21.5",
+-      "resolved": "https://registry.npmjs.org/esbuild/-/esbuild-0.21.5.tgz",
+-      "integrity": "sha512-mg3OPMV4hXywwpoDxu3Qda5xCKQi+vCTZq8S9J/EpkhB2HzKXq4SNFZE3+NK93JYxc8VMSep+lOUSC/RVKaBqw==",
+-      "dev": true,
+-      "hasInstallScript": true,
+-      "license": "MIT",
+-      "bin": {
+-        "esbuild": "bin/esbuild"
+-      },
+-      "engines": {
+-        "node": ">=12"
+-      },
+-      "optionalDependencies": {
+-        "@esbuild/aix-ppc64": "0.21.5",
+-        "@esbuild/android-arm": "0.21.5",
+-        "@esbuild/android-arm64": "0.21.5",
+-        "@esbuild/android-x64": "0.21.5",
+-        "@esbuild/darwin-arm64": "0.21.5",
+-        "@esbuild/darwin-x64": "0.21.5",
+-        "@esbuild/freebsd-arm64": "0.21.5",
+-        "@esbuild/freebsd-x64": "0.21.5",
+-        "@esbuild/linux-arm": "0.21.5",
+-        "@esbuild/linux-arm64": "0.21.5",
+-        "@esbuild/linux-ia32": "0.21.5",
+-        "@esbuild/linux-loong64": "0.21.5",
+-        "@esbuild/linux-mips64el": "0.21.5",
+-        "@esbuild/linux-ppc64": "0.21.5",
+-        "@esbuild/linux-riscv64": "0.21.5",
+-        "@esbuild/linux-s390x": "0.21.5",
+-        "@esbuild/linux-x64": "0.21.5",
+-        "@esbuild/netbsd-x64": "0.21.5",
+-        "@esbuild/openbsd-x64": "0.21.5",
+-        "@esbuild/sunos-x64": "0.21.5",
+-        "@esbuild/win32-arm64": "0.21.5",
+-        "@esbuild/win32-ia32": "0.21.5",
+-        "@esbuild/win32-x64": "0.21.5"
+-      }
+-    },
+     "node_modules/escalade": {
+       "version": "3.2.0",
+       "resolved": "https://registry.npmjs.org/escalade/-/escalade-3.2.0.tgz",
+@@ -1726,6 +954,17 @@
+         "node": ">= 6"
+       }
+     },
++    "node_modules/fast-png": {
++      "version": "6.4.0",
++      "resolved": "https://registry.npmjs.org/fast-png/-/fast-png-6.4.0.tgz",
++      "integrity": "sha512-kAqZq1TlgBjZcLr5mcN6NP5Rv4V2f22z00c3g8vRrwkcqjerx7BEhPbOnWCPqaHUl2XWQBJQvOT/FQhdMT7X/Q==",
++      "license": "MIT",
++      "dependencies": {
++        "@types/pako": "^2.0.3",
++        "iobuffer": "^5.3.2",
++        "pako": "^2.1.0"
++      }
++    },
+     "node_modules/fastq": {
+       "version": "1.20.1",
+       "resolved": "https://registry.npmjs.org/fastq/-/fastq-1.20.1.tgz",
+@@ -1794,16 +1033,6 @@
+         "url": "https://github.com/sponsors/ljharb"
+       }
+     },
+-    "node_modules/gensync": {
+-      "version": "1.0.0-beta.2",
+-      "resolved": "https://registry.npmjs.org/gensync/-/gensync-1.0.0-beta.2.tgz",
+-      "integrity": "sha512-3hN7NaskYvMDLQY55gnW3NQ+mesEAepTqlg+VEbj7zzqEMBVNhzcGYYeqFo/TlYz6eQiFcp1HcsCZO+nGgS8zg==",
+-      "dev": true,
+-      "license": "MIT",
+-      "engines": {
+-        "node": ">=6.9.0"
+-      }
+-    },
+     "node_modules/glob-parent": {
+       "version": "6.0.2",
+       "resolved": "https://registry.npmjs.org/glob-parent/-/glob-parent-6.0.2.tgz",
+@@ -1844,6 +1073,12 @@
+         "node": ">=8.0.0"
+       }
+     },
++    "node_modules/iobuffer": {
++      "version": "5.4.0",
++      "resolved": "https://registry.npmjs.org/iobuffer/-/iobuffer-5.4.0.tgz",
++      "integrity": "sha512-DRebOWuqDvxunfkNJAlc3IzWIPD5xVxwUNbHr7xKB8E6aLJxIPfNX3CoMJghcFjpv6RWQsrcJbghtEwSPoJqMA==",
++      "license": "MIT"
++    },
+     "node_modules/is-binary-path": {
+       "version": "2.1.0",
+       "resolved": "https://registry.npmjs.org/is-binary-path/-/is-binary-path-2.1.0.tgz",
+@@ -1922,48 +1157,282 @@
+       "integrity": "sha512-RdJUflcE3cUzKiMqQgsCu06FPu9UdIJO0beYbPhHN4k6apgJtifcoCtT9bcxOpYBtpD2kCM6Sbzg4CausW/PKQ==",
+       "license": "MIT"
+     },
+-    "node_modules/jsesc": {
+-      "version": "3.1.0",
+-      "resolved": "https://registry.npmjs.org/jsesc/-/jsesc-3.1.0.tgz",
+-      "integrity": "sha512-/sM3dO2FOzXjKQhJuo0Q173wf2KOo8t4I8vHy6lF9poUp7bKT0/NHE8fPX23PwfhnykfqnC2xRxOnVw5XuGIaA==",
+-      "dev": true,
++    "node_modules/jspdf": {
++      "version": "4.2.1",
++      "resolved": "https://registry.npmjs.org/jspdf/-/jspdf-4.2.1.tgz",
++      "integrity": "sha512-YyAXyvnmjTbR4bHQRLzex3CuINCDlQnBqoSYyjJwTP2x9jDLuKDzy7aKUl0hgx3uhcl7xzg32agn5vlie6HIlQ==",
+       "license": "MIT",
+-      "bin": {
+-        "jsesc": "bin/jsesc"
++      "dependencies": {
++        "@babel/runtime": "^7.28.6",
++        "fast-png": "^6.2.0",
++        "fflate": "^0.8.1"
++      },
++      "optionalDependencies": {
++        "canvg": "^3.0.11",
++        "core-js": "^3.6.0",
++        "dompurify": "^3.3.1",
++        "html2canvas": "^1.0.0-rc.5"
++      }
++    },
++    "node_modules/lightningcss": {
++      "version": "1.33.0",
++      "resolved": "https://registry.npmjs.org/lightningcss/-/lightningcss-1.33.0.tgz",
++      "integrity": "sha512-WkUDrojuJs0xkgGf2udWxa3yGBRxPtxUkB79i6aCZLRgc7PM8fZe9TosfPDcvEpQZbuFASnHYmRLBLUbmLOIIA==",
++      "dev": true,
++      "license": "MPL-2.0",
++      "dependencies": {
++        "detect-libc": "^2.0.3"
+       },
+       "engines": {
+-        "node": ">=6"
++        "node": ">= 12.0.0"
++      },
++      "funding": {
++        "type": "opencollective",
++        "url": "https://opencollective.com/parcel"
++      },
++      "optionalDependencies": {
++        "lightningcss-android-arm64": "1.33.0",
++        "lightningcss-darwin-arm64": "1.33.0",
++        "lightningcss-darwin-x64": "1.33.0",
++        "lightningcss-freebsd-x64": "1.33.0",
++        "lightningcss-linux-arm-gnueabihf": "1.33.0",
++        "lightningcss-linux-arm64-gnu": "1.33.0",
++        "lightningcss-linux-arm64-musl": "1.33.0",
++        "lightningcss-linux-x64-gnu": "1.33.0",
++        "lightningcss-linux-x64-musl": "1.33.0",
++        "lightningcss-win32-arm64-msvc": "1.33.0",
++        "lightningcss-win32-x64-msvc": "1.33.0"
++      }
++    },
++    "node_modules/lightningcss-android-arm64": {
++      "version": "1.33.0",
++      "resolved": "https://registry.npmjs.org/lightningcss-android-arm64/-/lightningcss-android-arm64-1.33.0.tgz",
++      "integrity": "sha512-gEpRTalKdosp4Bb8qWtc2iOgE5SeIHlpS1up9bFq2wAyYhl1UdTObYiHe98zEM9SQvSoqQZ1IQD0JNpg3Ml5pg==",
++      "cpu": [
++        "arm64"
++      ],
++      "dev": true,
++      "license": "MPL-2.0",
++      "optional": true,
++      "os": [
++        "android"
++      ],
++      "engines": {
++        "node": ">= 12.0.0"
++      },
++      "funding": {
++        "type": "opencollective",
++        "url": "https://opencollective.com/parcel"
+       }
+     },
+-    "node_modules/json5": {
+-      "version": "2.2.3",
+-      "resolved": "https://registry.npmjs.org/json5/-/json5-2.2.3.tgz",
+-      "integrity": "sha512-XmOWe7eyHYH14cLdVPoyg+GOH3rYX++KpzrylJwSW98t3Nk+U8XOl8FWKOgwtzdb8lXGf6zYwDUzeHMWfxasyg==",
++    "node_modules/lightningcss-darwin-arm64": {
++      "version": "1.33.0",
++      "resolved": "https://registry.npmjs.org/lightningcss-darwin-arm64/-/lightningcss-darwin-arm64-1.33.0.tgz",
++      "integrity": "sha512-Sciaz8eenNTKn9b3t7+xr0ipTp9YxKQY4npwQ3mrRuL0BAVHBLyZxofhaKBAVtzmtRZ/zTyo0/to4B1uWG/Djg==",
++      "cpu": [
++        "arm64"
++      ],
+       "dev": true,
+-      "license": "MIT",
+-      "bin": {
+-        "json5": "lib/cli.js"
++      "license": "MPL-2.0",
++      "optional": true,
++      "os": [
++        "darwin"
++      ],
++      "engines": {
++        "node": ">= 12.0.0"
+       },
++      "funding": {
++        "type": "opencollective",
++        "url": "https://opencollective.com/parcel"
++      }
++    },
++    "node_modules/lightningcss-darwin-x64": {
++      "version": "1.33.0",
++      "resolved": "https://registry.npmjs.org/lightningcss-darwin-x64/-/lightningcss-darwin-x64-1.33.0.tgz",
++      "integrity": "sha512-Z5UPAxzrjlWNNyGy6i65cJzzvgJ5D3T6wMvs+gWpY9d7qRhANrxqAp6LhxIgZhWEw18RfJTGcRxjuLIBr+m8XQ==",
++      "cpu": [
++        "x64"
++      ],
++      "dev": true,
++      "license": "MPL-2.0",
++      "optional": true,
++      "os": [
++        "darwin"
++      ],
+       "engines": {
+-        "node": ">=6"
++        "node": ">= 12.0.0"
++      },
++      "funding": {
++        "type": "opencollective",
++        "url": "https://opencollective.com/parcel"
+       }
+     },
+-    "node_modules/jspdf": {
+-      "version": "2.5.2",
+-      "resolved": "https://registry.npmjs.org/jspdf/-/jspdf-2.5.2.tgz",
+-      "integrity": "sha512-myeX9c+p7znDWPk0eTrujCzNjT+CXdXyk7YmJq5nD5V7uLLKmSXnlQ/Jn/kuo3X09Op70Apm0rQSnFWyGK8uEQ==",
+-      "license": "MIT",
+-      "dependencies": {
+-        "@babel/runtime": "^7.23.2",
+-        "atob": "^2.1.2",
+-        "btoa": "^1.2.1",
+-        "fflate": "^0.8.1"
++    "node_modules/lightningcss-freebsd-x64": {
++      "version": "1.33.0",
++      "resolved": "https://registry.npmjs.org/lightningcss-freebsd-x64/-/lightningcss-freebsd-x64-1.33.0.tgz",
++      "integrity": "sha512-QQM/Ti/hQajJwCY+RiWuCZ9sdtI/XQk7nDK5vC8kkdwixezOlDgvDx7+RT+QjK6FcFT4MpsuoBnHIo/O3StRRg==",
++      "cpu": [
++        "x64"
++      ],
++      "dev": true,
++      "license": "MPL-2.0",
++      "optional": true,
++      "os": [
++        "freebsd"
++      ],
++      "engines": {
++        "node": ">= 12.0.0"
+       },
+-      "optionalDependencies": {
+-        "canvg": "^3.0.6",
+-        "core-js": "^3.6.0",
+-        "dompurify": "^2.5.4",
+-        "html2canvas": "^1.0.0-rc.5"
++      "funding": {
++        "type": "opencollective",
++        "url": "https://opencollective.com/parcel"
++      }
++    },
++    "node_modules/lightningcss-linux-arm-gnueabihf": {
++      "version": "1.33.0",
++      "resolved": "https://registry.npmjs.org/lightningcss-linux-arm-gnueabihf/-/lightningcss-linux-arm-gnueabihf-1.33.0.tgz",
++      "integrity": "sha512-N7FVBe6iS24MlM6R/4RBTxGhQheZGs7tiQ9U32UtF75NzP5Q7xWPRqLBCKxlRQRk3rY1jCIPLzx7WzOhuUIRLQ==",
++      "cpu": [
++        "arm"
++      ],
++      "dev": true,
++      "license": "MPL-2.0",
++      "optional": true,
++      "os": [
++        "linux"
++      ],
++      "engines": {
++        "node": ">= 12.0.0"
++      },
++      "funding": {
++        "type": "opencollective",
++        "url": "https://opencollective.com/parcel"
++      }
++    },
++    "node_modules/lightningcss-linux-arm64-gnu": {
++      "version": "1.33.0",
++      "resolved": "https://registry.npmjs.org/lightningcss-linux-arm64-gnu/-/lightningcss-linux-arm64-gnu-1.33.0.tgz",
++      "integrity": "sha512-j2v/itmy4HlNxlc6voKXYgBqNi0Ng2LShg4z7GufpEgs05P+2suBVyi9I6YHq5uoVFx9ETin3eCEhLVyXGQnKg==",
++      "cpu": [
++        "arm64"
++      ],
++      "dev": true,
++      "license": "MPL-2.0",
++      "optional": true,
++      "os": [
++        "linux"
++      ],
++      "engines": {
++        "node": ">= 12.0.0"
++      },
++      "funding": {
++        "type": "opencollective",
++        "url": "https://opencollective.com/parcel"
++      }
++    },
++    "node_modules/lightningcss-linux-arm64-musl": {
++      "version": "1.33.0",
++      "resolved": "https://registry.npmjs.org/lightningcss-linux-arm64-musl/-/lightningcss-linux-arm64-musl-1.33.0.tgz",
++      "integrity": "sha512-yiO5ROMuYQgXbC60yjZU5CYSFZGKXL0HFATXt9mHJn1+zW55oCtMI9NfcVhYLMFDL7gV7oBPon/EmMMGg2OvtQ==",
++      "cpu": [
++        "arm64"
++      ],
++      "dev": true,
++      "license": "MPL-2.0",
++      "optional": true,
++      "os": [
++        "linux"
++      ],
++      "engines": {
++        "node": ">= 12.0.0"
++      },
++      "funding": {
++        "type": "opencollective",
++        "url": "https://opencollective.com/parcel"
++      }
++    },
++    "node_modules/lightningcss-linux-x64-gnu": {
++      "version": "1.33.0",
++      "resolved": "https://registry.npmjs.org/lightningcss-linux-x64-gnu/-/lightningcss-linux-x64-gnu-1.33.0.tgz",
++      "integrity": "sha512-ar+Ju7LmcN0Jo4FpL4hpFybwNG9/3A/Br5KW2n2jyODg3MEZXaDYADdemoNS+BDNfMgKvylJLj4S5tyRActuAg==",
++      "cpu": [
++        "x64"
++      ],
++      "dev": true,
++      "license": "MPL-2.0",
++      "optional": true,
++      "os": [
++        "linux"
++      ],
++      "engines": {
++        "node": ">= 12.0.0"
++      },
++      "funding": {
++        "type": "opencollective",
++        "url": "https://opencollective.com/parcel"
++      }
++    },
++    "node_modules/lightningcss-linux-x64-musl": {
++      "version": "1.33.0",
++      "resolved": "https://registry.npmjs.org/lightningcss-linux-x64-musl/-/lightningcss-linux-x64-musl-1.33.0.tgz",
++      "integrity": "sha512-RYiYbkokw0trfKqqzfF55lginwEPrD3OJDfTuJzFs1MK6iFnDenaz1fqLLtX4ITG3OktJQXOeTaw1awrBAlZPw==",
++      "cpu": [
++        "x64"
++      ],
++      "dev": true,
++      "license": "MPL-2.0",
++      "optional": true,
++      "os": [
++        "linux"
++      ],
++      "engines": {
++        "node": ">= 12.0.0"
++      },
++      "funding": {
++        "type": "opencollective",
++        "url": "https://opencollective.com/parcel"
++      }
++    },
++    "node_modules/lightningcss-win32-arm64-msvc": {
++      "version": "1.33.0",
++      "resolved": "https://registry.npmjs.org/lightningcss-win32-arm64-msvc/-/lightningcss-win32-arm64-msvc-1.33.0.tgz",
++      "integrity": "sha512-1K+MPfLSFVpphzpdbfkhlWk6wBrTObBzS2T6db10PNOZgR9GoVsAWzwNyuhUYYbTp23j+4RrncfujZ4uAzXvwA==",
++      "cpu": [
++        "arm64"
++      ],
++      "dev": true,
++      "license": "MPL-2.0",
++      "optional": true,
++      "os": [
++        "win32"
++      ],
++      "engines": {
++        "node": ">= 12.0.0"
++      },
++      "funding": {
++        "type": "opencollective",
++        "url": "https://opencollective.com/parcel"
++      }
++    },
++    "node_modules/lightningcss-win32-x64-msvc": {
++      "version": "1.33.0",
++      "resolved": "https://registry.npmjs.org/lightningcss-win32-x64-msvc/-/lightningcss-win32-x64-msvc-1.33.0.tgz",
++      "integrity": "sha512-OlEICDx/Xl0FqSp4bry8zFnCvGpig3Gl4gCquvYwHuqJKEC1+n9NgDniFvqHGmMv1ZkqDJrDqKKSykTDX+ehuA==",
++      "cpu": [
++        "x64"
++      ],
++      "dev": true,
++      "license": "MPL-2.0",
++      "optional": true,
++      "os": [
++        "win32"
++      ],
++      "engines": {
++        "node": ">= 12.0.0"
++      },
++      "funding": {
++        "type": "opencollective",
++        "url": "https://opencollective.com/parcel"
+       }
+     },
+     "node_modules/lilconfig": {
+@@ -1998,16 +1467,6 @@
+         "loose-envify": "cli.js"
+       }
+     },
+-    "node_modules/lru-cache": {
+-      "version": "5.1.1",
+-      "resolved": "https://registry.npmjs.org/lru-cache/-/lru-cache-5.1.1.tgz",
+-      "integrity": "sha512-KpNARQA3Iwv+jTA0utUVVbrh+Jlrr1Fv0e56GGzAFOXN7dk/FviaDW8LHmK52DlcH4WP2n6gI8vN1aesBFgo9w==",
+-      "dev": true,
+-      "license": "ISC",
+-      "dependencies": {
+-        "yallist": "^3.0.2"
+-      }
+-    },
+     "node_modules/lucide-react": {
+       "version": "0.344.0",
+       "resolved": "https://registry.npmjs.org/lucide-react/-/lucide-react-0.344.0.tgz",
+@@ -2041,13 +1500,6 @@
+         "node": ">=8.6"
+       }
+     },
+-    "node_modules/ms": {
+-      "version": "2.1.3",
+-      "resolved": "https://registry.npmjs.org/ms/-/ms-2.1.3.tgz",
+-      "integrity": "sha512-6FlzubTLZG3J2a/NVCAleEhjzq5oxgHyaCU9yYXvcLsvoVaHJq/s5xXI6/XXP6tz7R9xAOtHnSO/tXtF3WRTlA==",
+-      "dev": true,
+-      "license": "MIT"
+-    },
+     "node_modules/mz": {
+       "version": "2.7.0",
+       "resolved": "https://registry.npmjs.org/mz/-/mz-2.7.0.tgz",
+@@ -2119,6 +1571,22 @@
+         "node": ">= 6"
+       }
+     },
++    "node_modules/pako": {
++      "version": "2.2.0",
++      "resolved": "https://registry.npmjs.org/pako/-/pako-2.2.0.tgz",
++      "integrity": "sha512-zJq6RP/5q+TO2OpFV3FHzlPnFjmkb7Nc99a5SNjJE+uu/PkpChs+NIZSSzbBoD+6kjiISXjfYdwj1ZRQ81dz/w==",
++      "funding": [
++        {
++          "type": "github",
++          "url": "https://github.com/sponsors/puzrin"
++        },
++        {
++          "type": "github",
++          "url": "https://github.com/sponsors/nodeca"
++        }
++      ],
++      "license": "(MIT AND Zlib)"
++    },
+     "node_modules/path-parse": {
+       "version": "1.0.7",
+       "resolved": "https://registry.npmjs.org/path-parse/-/path-parse-1.0.7.tgz",
+@@ -2174,9 +1642,9 @@
+       }
+     },
+     "node_modules/postcss": {
+-      "version": "8.5.23",
+-      "resolved": "https://registry.npmjs.org/postcss/-/postcss-8.5.23.tgz",
+-      "integrity": "sha512-g50586zr4bZmwFiTlflMu8E0bDTb5I5gertgwAKmsdUlTQIhZtunzUlD1WSzwcVWPoAVpsrA6vlfCD7oXvRwgg==",
++      "version": "8.5.24",
++      "resolved": "https://registry.npmjs.org/postcss/-/postcss-8.5.24.tgz",
++      "integrity": "sha512-8RyVklq0owXUTa4xlpzu4l9AaVKIdQvAcOHZWaMh98HgySsUtxRVf/chRe3dsSLqb6i40BzGRzEUddRaI+9TSw==",
+       "dev": true,
+       "funding": [
+         {
+@@ -2392,16 +1860,6 @@
+         "react": "^18.3.1"
+       }
+     },
+-    "node_modules/react-refresh": {
+-      "version": "0.17.0",
+-      "resolved": "https://registry.npmjs.org/react-refresh/-/react-refresh-0.17.0.tgz",
+-      "integrity": "sha512-z6F7K9bV85EfseRCp2bzrpyQ0Gkw1uLoCel9XBVWPg/TjRj94SkJzUTGfOa4bs7iJvBWtQG0Wq7wnI0syw3EBQ==",
+-      "dev": true,
+-      "license": "MIT",
+-      "engines": {
+-        "node": ">=0.10.0"
+-      }
+-    },
+     "node_modules/read-cache": {
+       "version": "1.0.0",
+       "resolved": "https://registry.npmjs.org/read-cache/-/read-cache-1.0.0.tgz",
+@@ -2475,49 +1933,38 @@
+         "node": ">= 0.8.15"
+       }
+     },
+-    "node_modules/rollup": {
+-      "version": "4.62.3",
+-      "resolved": "https://registry.npmjs.org/rollup/-/rollup-4.62.3.tgz",
+-      "integrity": "sha512-Gu0c0iH9FzgX1L1t7ByIbbS3Vmdz+6KHm/EsqmmC71gUQ82yvZRkTK6XzrFObSka91WUVdynqp6nsfilzr5k6Q==",
++    "node_modules/rolldown": {
++      "version": "1.1.5",
++      "resolved": "https://registry.npmjs.org/rolldown/-/rolldown-1.1.5.tgz",
++      "integrity": "sha512-t9z29cJjXf/vxQ8dyhCSpt6H6aSwHTk8cT5I3iy6SMXuFpk5mB6PL6XfC8PCwrPTx93udwKUm9HRteAlTGBLiA==",
+       "dev": true,
+       "license": "MIT",
+       "dependencies": {
+-        "@types/estree": "1.0.9"
++        "@oxc-project/types": "=0.139.0",
++        "@rolldown/pluginutils": "^1.0.0"
+       },
+       "bin": {
+-        "rollup": "dist/bin/rollup"
++        "rolldown": "bin/cli.mjs"
+       },
+       "engines": {
+-        "node": ">=18.0.0",
+-        "npm": ">=8.0.0"
++        "node": "^20.19.0 || >=22.12.0"
+       },
+       "optionalDependencies": {
+-        "@rollup/rollup-android-arm-eabi": "4.62.3",
+-        "@rollup/rollup-android-arm64": "4.62.3",
+-        "@rollup/rollup-darwin-arm64": "4.62.3",
+-        "@rollup/rollup-darwin-x64": "4.62.3",
+-        "@rollup/rollup-freebsd-arm64": "4.62.3",
+-        "@rollup/rollup-freebsd-x64": "4.62.3",
+-        "@rollup/rollup-linux-arm-gnueabihf": "4.62.3",
+-        "@rollup/rollup-linux-arm-musleabihf": "4.62.3",
+-        "@rollup/rollup-linux-arm64-gnu": "4.62.3",
+-        "@rollup/rollup-linux-arm64-musl": "4.62.3",
+-        "@rollup/rollup-linux-loong64-gnu": "4.62.3",
+-        "@rollup/rollup-linux-loong64-musl": "4.62.3",
+-        "@rollup/rollup-linux-ppc64-gnu": "4.62.3",
+-        "@rollup/rollup-linux-ppc64-musl": "4.62.3",
+-        "@rollup/rollup-linux-riscv64-gnu": "4.62.3",
+-        "@rollup/rollup-linux-riscv64-musl": "4.62.3",
+-        "@rollup/rollup-linux-s390x-gnu": "4.62.3",
+-        "@rollup/rollup-linux-x64-gnu": "4.62.3",
+-        "@rollup/rollup-linux-x64-musl": "4.62.3",
+-        "@rollup/rollup-openbsd-x64": "4.62.3",
+-        "@rollup/rollup-openharmony-arm64": "4.62.3",
+-        "@rollup/rollup-win32-arm64-msvc": "4.62.3",
+-        "@rollup/rollup-win32-ia32-msvc": "4.62.3",
+-        "@rollup/rollup-win32-x64-gnu": "4.62.3",
+-        "@rollup/rollup-win32-x64-msvc": "4.62.3",
+-        "fsevents": "~2.3.2"
++        "@rolldown/binding-android-arm64": "1.1.5",
++        "@rolldown/binding-darwin-arm64": "1.1.5",
++        "@rolldown/binding-darwin-x64": "1.1.5",
++        "@rolldown/binding-freebsd-x64": "1.1.5",
++        "@rolldown/binding-linux-arm-gnueabihf": "1.1.5",
++        "@rolldown/binding-linux-arm64-gnu": "1.1.5",
++        "@rolldown/binding-linux-arm64-musl": "1.1.5",
++        "@rolldown/binding-linux-ppc64-gnu": "1.1.5",
++        "@rolldown/binding-linux-s390x-gnu": "1.1.5",
++        "@rolldown/binding-linux-x64-gnu": "1.1.5",
++        "@rolldown/binding-linux-x64-musl": "1.1.5",
++        "@rolldown/binding-openharmony-arm64": "1.1.5",
++        "@rolldown/binding-wasm32-wasi": "1.1.5",
++        "@rolldown/binding-win32-arm64-msvc": "1.1.5",
++        "@rolldown/binding-win32-x64-msvc": "1.1.5"
+       }
+     },
+     "node_modules/run-parallel": {
+@@ -2553,16 +2000,6 @@
+         "loose-envify": "^1.1.0"
+       }
+     },
+-    "node_modules/semver": {
+-      "version": "6.3.1",
+-      "resolved": "https://registry.npmjs.org/semver/-/semver-6.3.1.tgz",
+-      "integrity": "sha512-BR7VvDCVHO+q2xBEWskxS6DJE1qRnb7DxzUrogb71CWoSficBxYsiAGd+Kl0mmq/MprG9yArRkyrQxTO6XjMzA==",
+-      "dev": true,
+-      "license": "ISC",
+-      "bin": {
+-        "semver": "bin/semver.js"
+-      }
+-    },
+     "node_modules/source-map-js": {
+       "version": "1.2.1",
+       "resolved": "https://registry.npmjs.org/source-map-js/-/source-map-js-1.2.1.tgz",
+@@ -2768,6 +2205,14 @@
+       "dev": true,
+       "license": "Apache-2.0"
+     },
++    "node_modules/tslib": {
++      "version": "2.8.1",
++      "resolved": "https://registry.npmjs.org/tslib/-/tslib-2.8.1.tgz",
++      "integrity": "sha512-oJFu94HQb+KVduSUQL7wnpmqnfmLsOA/nAh6b6EH0wCEoK0/mPeXU6c3wKDV83MkOuHPRHtSXKKU99IBazS/2w==",
++      "dev": true,
++      "license": "0BSD",
++      "optional": true
++    },
+     "node_modules/update-browserslist-db": {
+       "version": "1.2.3",
+       "resolved": "https://registry.npmjs.org/update-browserslist-db/-/update-browserslist-db-1.2.3.tgz",
+@@ -2817,21 +2262,23 @@
+       }
+     },
+     "node_modules/vite": {
+-      "version": "5.4.21",
+-      "resolved": "https://registry.npmjs.org/vite/-/vite-5.4.21.tgz",
+-      "integrity": "sha512-o5a9xKjbtuhY6Bi5S3+HvbRERmouabWbyUcpXXUA1u+GNUKoROi9byOJ8M0nHbHYHkYICiMlqxkg1KkYmm25Sw==",
++      "version": "8.1.5",
++      "resolved": "https://registry.npmjs.org/vite/-/vite-8.1.5.tgz",
++      "integrity": "sha512-7ULLwsCdYx/nRyrpiEwvqb5TFHrMVZyBt+rg/OAXT7rgj/z+DtTDyKFeLAdDkubDVDKD8jOsndmy7m55XcfUsw==",
+       "dev": true,
+       "license": "MIT",
+       "dependencies": {
+-        "esbuild": "^0.21.3",
+-        "postcss": "^8.4.43",
+-        "rollup": "^4.20.0"
++        "lightningcss": "^1.32.0",
++        "picomatch": "^4.0.5",
++        "postcss": "^8.5.17",
++        "rolldown": "~1.1.5",
++        "tinyglobby": "^0.2.17"
+       },
+       "bin": {
+         "vite": "bin/vite.js"
+       },
+       "engines": {
+-        "node": "^18.0.0 || >=20.0.0"
++        "node": "^20.19.0 || >=22.12.0"
+       },
+       "funding": {
+         "url": "https://github.com/vitejs/vite?sponsor=1"
+@@ -2840,23 +2287,33 @@
+         "fsevents": "~2.3.3"
+       },
+       "peerDependencies": {
+-        "@types/node": "^18.0.0 || >=20.0.0",
+-        "less": "*",
+-        "lightningcss": "^1.21.0",
+-        "sass": "*",
+-        "sass-embedded": "*",
+-        "stylus": "*",
+-        "sugarss": "*",
+-        "terser": "^5.4.0"
++        "@types/node": "^20.19.0 || >=22.12.0",
++        "@vitejs/devtools": "^0.3.0",
++        "esbuild": "^0.27.0 || ^0.28.0",
++        "jiti": ">=1.21.0",
++        "less": "^4.0.0",
++        "sass": "^1.70.0",
++        "sass-embedded": "^1.70.0",
++        "stylus": ">=0.54.8",
++        "sugarss": "^5.0.0",
++        "terser": "^5.16.0",
++        "tsx": "^4.8.1",
++        "yaml": "^2.4.2"
+       },
+       "peerDependenciesMeta": {
+         "@types/node": {
+           "optional": true
+         },
+-        "less": {
++        "@vitejs/devtools": {
++          "optional": true
++        },
++        "esbuild": {
++          "optional": true
++        },
++        "jiti": {
+           "optional": true
+         },
+-        "lightningcss": {
++        "less": {
+           "optional": true
+         },
+         "sass": {
+@@ -2873,15 +2330,27 @@
+         },
+         "terser": {
+           "optional": true
++        },
++        "tsx": {
++          "optional": true
++        },
++        "yaml": {
++          "optional": true
+         }
+       }
+     },
+-    "node_modules/yallist": {
+-      "version": "3.1.1",
+-      "resolved": "https://registry.npmjs.org/yallist/-/yallist-3.1.1.tgz",
+-      "integrity": "sha512-a4UGQaWPH59mOXUYnAG2ewncQS4i4F43Tv3JoAM+s2VDAmS9NsK8GpDMLrCHPksFT7h3K6TOoUNn2pb7RoXx4g==",
++    "node_modules/vite/node_modules/picomatch": {
++      "version": "4.0.5",
++      "resolved": "https://registry.npmjs.org/picomatch/-/picomatch-4.0.5.tgz",
++      "integrity": "sha512-RvwwcruNjI1ncT5xRakeyS9Lf8lcItv34KD+aif+VH9kduAyfYBipGh12274xtenIPZ119/R9BdTBa8gAwSh0A==",
+       "dev": true,
+-      "license": "ISC"
++      "license": "MIT",
++      "engines": {
++        "node": ">=12"
++      },
++      "funding": {
++        "url": "https://github.com/sponsors/jonschlinkert"
++      }
+     }
+   }
+ }
+diff --git a/web/package.json b/web/package.json
+index b2d780d..30b1a3b 100644
+--- a/web/package.json
++++ b/web/package.json
+@@ -10,7 +10,7 @@
+     "preview": "vite preview"
+   },
+   "dependencies": {
+-    "jspdf": "^2.5.1",
++    "jspdf": "^4.2.1",
+     "lucide-react": "^0.344.0",
+     "react": "^18.2.0",
+     "react-dom": "^18.2.0"
+@@ -18,10 +18,10 @@
+   "devDependencies": {
+     "@types/react": "^18.2.66",
+     "@types/react-dom": "^18.2.22",
+-    "@vitejs/plugin-react": "^4.2.1",
++    "@vitejs/plugin-react": "^6.0.4",
+     "autoprefixer": "^10.4.18",
+     "postcss": "^8.4.35",
+     "tailwindcss": "^3.4.1",
+-    "vite": "^5.1.6"
++    "vite": "^8.1.5"
+   }
+ }
+diff --git a/web/src/App.jsx b/web/src/App.jsx
+index fe9b407..ca2b26f 100644
+--- a/web/src/App.jsx
++++ b/web/src/App.jsx
+@@ -128,7 +128,7 @@ export default function App() {
+             />
+           )}
+ 
+-          {activeTab === 'devdocs' && (
++          {activeTab === 'devdocs' && currentUser?.role === 'ADMIN' && (
+             <DevDocsView />
+           )}
+         </main>
+diff --git a/web/src/components/Sidebar.jsx b/web/src/components/Sidebar.jsx
+index 89e3516..89294f7 100644
+--- a/web/src/components/Sidebar.jsx
++++ b/web/src/components/Sidebar.jsx
+@@ -33,10 +33,11 @@ export default function Sidebar({
+ 
+   if (currentUser?.role === 'ADMIN') {
+     menuItems.push({ id: 'admin', label: t.navAdmin, icon: ShieldAlert, highlight: true });
++    // Dev Docs exposes the Firestore schema and sample backend code — admin-only,
++    // not a general nav item every resident could previously see.
++    menuItems.push({ id: 'devdocs', label: t.navDevDocs, icon: Code2 });
+   }
+ 
+-  menuItems.push({ id: 'devdocs', label: t.navDevDocs, icon: Code2 });
+-
+   return (
+     <>
+       {/* Mobile Drawer Overlay */}

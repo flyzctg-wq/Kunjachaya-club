@@ -1,0 +1,6 @@
+{
+  "name": "Kunjachaya Resident Club Management System",
+  "description": "Residential club management app for Kunjachaya Resident Club with bilingual EN/BN support, dues payment, notices, complaints, and admin portal.",
+  "requestFramePermissions": [],
+  "majorCapabilities": ["MAJOR_CAPABILITY_SERVER_SIDE_GEMINI_API"]
+}

@@ -1,0 +1,15 @@
+<?xml version="1.0" encoding="utf-8"?><!--
+   Sample backup rules file; uncomment and customize as necessary.
+   See https://developer.android.com/guide/topics/data/autobackup
+   for details.
+   Note: This file is ignored for devices older than API 31
+   See https://developer.android.com/about/versions/12/backup-restore
+-->
+<full-backup-content>
+    <!-- Excluded: local resident DB holds NID references, addresses, phone numbers,
+         and financial records. Firestore is the durable backend; the local Room DB
+         is a cache only and must not be swept into Android's cloud/device backup. -->
+    <exclude domain="database" path="kunjachhaya_club_db" />
+    <exclude domain="database" path="kunjachhaya_club_db-wal" />
+    <exclude domain="database" path="kunjachhaya_club_db-shm" />
+</full-backup-content>
