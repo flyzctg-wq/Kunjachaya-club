@@ -13,8 +13,13 @@ import kotlinx.coroutines.tasks.await
  * are the only way those fields change at all.
  */
 class FunctionsRepository {
-    private val functions: FirebaseFunctions by lazy {
-        FirebaseFunctions.getInstance("asia-southeast1")
+    private val functions: FirebaseFunctions? by lazy {
+        try {
+            FirebaseFunctions.getInstance("asia-southeast1")
+        } catch (e: Exception) {
+            e.printStackTrace()
+            null
+        }
     }
 
     sealed class Outcome<out T> {
@@ -23,8 +28,9 @@ class FunctionsRepository {
     }
 
     private suspend fun <T> call(name: String, data: Map<String, Any?>, extract: (Map<*, *>) -> T): Outcome<T> {
+        val f = functions ?: return Outcome.Failure("Firebase Cloud Functions is unavailable")
         return try {
-            val result = functions.getHttpsCallable(name).call(data).await()
+            val result = f.getHttpsCallable(name).call(data).await()
             @Suppress("UNCHECKED_CAST")
             val map = result.data as? Map<*, *> ?: emptyMap<String, Any?>()
             Outcome.Success(extract(map))
