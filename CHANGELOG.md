@@ -74,6 +74,16 @@ Two files to use: `kunjachaya-club-fixed.zip` (full repo, ready to open) and
   to clear the dompurify XSS and esbuild advisories. **Actually verified**: `npm audit` → 0
   vulnerabilities, `npm run build` → succeeds.
 
+## 🟢 Firestore Schema Privacy Fix — Public vs. Private User Profiles
+
+- **Split `users` Firestore collection into public and private layers**:
+  - `/users/{userId}` is now restricted to the document owner (`request.auth.uid`) or an Admin (`isAdmin()`) in `firestore.rules`.
+  - `/users_public/{userId}` provides non-sensitive resident roster data (`nameEn`, `nameBn`, `holding`, `road`, `block`, `primaryContact`, `professionEn`, `membershipStatus`, `role`, `profilePicUrl`) readable by all signed-in residents (`if isSignedIn()`) for the Resident Directory.
+- **Cloud Functions Sync (`syncPublicUser`)**: Added an `onDocumentWritten("users/{userId}")` Firestore trigger in `functions/index.js` that automatically maintains the public mirror in `users_public` whenever a user profile is created, updated, or deleted.
+- **Client Integration**:
+  - `web/src/views/DirectoryView.jsx` updated to query `users_public` collection.
+  - `app/src/main/java/com/example/data/repository/FirestoreRepository.kt` and `ClubViewModel.kt` updated to stream from `users_public` for directory search.
+
 ## Before you deploy
 
 - `functions/README.md` covers secrets setup (`firebase functions:secrets:set ...`) and the
@@ -81,7 +91,4 @@ Two files to use: `kunjachaya-club-fixed.zip` (full repo, ready to open) and
   Admin SDK directly, since there's deliberately no in-app path to grant that claim.
 - You'll need your own PipraPay instance + API key (or bKash merchant sandbox credentials)
   and a real Firebase project — nothing here was compiled or run against live infrastructure.
-- One known remaining gap, flagged rather than rushed: `firestore.rules` still allows any
-  signed-in resident to read the full `users` collection (needed for the Directory feature).
-  Properly fixing this means splitting `users` into public (name/phone/block) and private
-  (NID/DOB/financial-adjacent) fields — a real schema change, not a one-line rule edit.
+

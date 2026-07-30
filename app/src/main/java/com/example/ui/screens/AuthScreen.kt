@@ -1,5 +1,6 @@
 package com.example.ui.screens
 
+import android.app.Activity
 import androidx.compose.foundation.Image
 import androidx.compose.foundation.background
 import androidx.compose.foundation.layout.*
@@ -19,6 +20,8 @@ import androidx.compose.ui.platform.testTag
 import androidx.fragment.app.FragmentActivity
 import android.widget.Toast
 import com.google.firebase.auth.FirebaseAuth
+import com.google.firebase.auth.PhoneAuthCredential
+import com.google.firebase.auth.PhoneAuthProvider
 import com.example.utils.BiometricAuthManager
 import androidx.compose.ui.res.painterResource
 import androidx.compose.ui.text.font.FontWeight
@@ -55,6 +58,10 @@ fun AuthScreen(
     var otpSent by remember { mutableStateOf(false) }
     var errorMessage by remember { mutableStateOf("") }
     var isAuthLoading by remember { mutableStateOf(false) }
+
+    // Phone OTP state: verificationId is returned by Firebase when the SMS is sent.
+    var verificationId by remember { mutableStateOf<String?>(null) }
+    var resendToken by remember { mutableStateOf<PhoneAuthProvider.ForceResendingToken?>(null) }
 
     var showBiometricModal by remember { mutableStateOf(false) }
     var biometricStatusMessage by remember { mutableStateOf("") }
@@ -401,7 +408,7 @@ fun AuthScreen(
                             )
                         }
                     } else {
-                        // Phone OTP Auth Mode
+                        // Phone OTP Auth Mode (real Firebase Phone Auth)
                         if (!otpSent) {
                             OutlinedTextField(
                                 value = phoneNumber,
@@ -410,25 +417,83 @@ fun AuthScreen(
                                 leadingIcon = { Icon(Icons.Default.Phone, contentDescription = null) },
                                 modifier = Modifier.fillMaxWidth().testTag("phone_input"),
                                 keyboardOptions = KeyboardOptions(keyboardType = KeyboardType.Phone),
-                                singleLine = true
+                                singleLine = true,
+                                placeholder = { Text("+880XXXXXXXXXX") }
                             )
 
-                            Spacer(modifier = Modifier.height(16.dp))
+                            Spacer(modifier = Modifier.height(8.dp))
+
+                            Text(
+                                text = if (lang == Language.BN)
+                                    "আন্তর্জাতিক ফরম্যাটে লিখুন, যেমন: +8801XXXXXXXXX"
+                                else
+                                    "Enter in international format, e.g. +8801XXXXXXXXX",
+                                fontSize = 12.sp,
+                                color = MaterialTheme.colorScheme.onSurfaceVariant,
+                                modifier = Modifier.padding(bottom = 8.dp)
+                            )
+
+                            Spacer(modifier = Modifier.height(8.dp))
 
                             Button(
                                 onClick = {
-                                    if (phoneNumber.isNotBlank()) {
-                                        otpSent = true
-                                        otpCode = "123456" // Default mock OTP
-                                    } else {
-                                        errorMessage = "Please enter valid phone number"
+                                    val activity = context as? Activity
+                                    if (activity == null) {
+                                        errorMessage = "Cannot access Activity for phone auth"
+                                        return@Button
                                     }
+                                    if (phoneNumber.isBlank()) {
+                                        errorMessage = if (lang == Language.BN)
+                                            "ফোন নম্বর দিন"
+                                        else
+                                            "Please enter your phone number"
+                                        return@Button
+                                    }
+                                    isAuthLoading = true
+                                    errorMessage = ""
+                                    val callbacks = object : PhoneAuthProvider.OnVerificationStateChangedCallbacks() {
+                                        override fun onVerificationCompleted(credential: PhoneAuthCredential) {
+                                            // Instant verification (e.g. SIM card auto-reads the SMS).
+                                            isAuthLoading = true
+                                            viewModel.signInWithPhoneCredential(credential) { ok, err ->
+                                                isAuthLoading = false
+                                                if (ok) onLoginSuccess()
+                                                else errorMessage = err ?: "Login failed"
+                                            }
+                                        }
+                                        override fun onVerificationFailed(e: com.google.firebase.FirebaseException) {
+                                            isAuthLoading = false
+                                            errorMessage = e.localizedMessage ?: "OTP send failed. Check your phone number format."
+                                        }
+                                        override fun onCodeSent(
+                                            vId: String,
+                                            token: PhoneAuthProvider.ForceResendingToken
+                                        ) {
+                                            isAuthLoading = false
+                                            verificationId = vId
+                                            resendToken = token
+                                            otpSent = true
+                                        }
+                                    }
+                                    viewModel.firebaseAuthRepository.sendPhoneOtp(
+                                        activity = activity,
+                                        phoneNumber = phoneNumber.trim(),
+                                        callbacks = callbacks,
+                                        forceResendingToken = resendToken
+                                    )
                                 },
+                                enabled = !isAuthLoading,
                                 modifier = Modifier.fillMaxWidth().height(48.dp).testTag("send_otp_btn")
                             ) {
-                                Icon(Icons.Default.Sms, contentDescription = null)
-                                Spacer(modifier = Modifier.width(8.dp))
-                                Text(AppLanguage.sendOtp(lang), fontSize = 16.sp, fontWeight = FontWeight.Bold)
+                                if (isAuthLoading) {
+                                    CircularProgressIndicator(modifier = Modifier.size(20.dp), color = Color.White)
+                                    Spacer(modifier = Modifier.width(8.dp))
+                                    Text(if (lang == Language.BN) "পাঠানো হচ্ছে..." else "Sending OTP...", fontSize = 14.sp)
+                                } else {
+                                    Icon(Icons.Default.Sms, contentDescription = null)
+                                    Spacer(modifier = Modifier.width(8.dp))
+                                    Text(AppLanguage.sendOtp(lang), fontSize = 16.sp, fontWeight = FontWeight.Bold)
+                                }
                             }
                         } else {
                             OutlinedTextField(
@@ -441,23 +506,98 @@ fun AuthScreen(
                                 singleLine = true
                             )
 
+                            Spacer(modifier = Modifier.height(8.dp))
+
                             Text(
-                                text = if (lang == Language.BN) "ডেমো ওটিপি: ১২৩৪৫৬" else "Demo OTP code: 123456",
+                                text = if (lang == Language.BN)
+                                    "আপনার ফোনে আসা ৬ সংখ্যার ওটিপি কোড দিন"
+                                else
+                                    "Enter the 6-digit OTP code sent to your phone",
                                 fontSize = 12.sp,
-                                color = MaterialTheme.colorScheme.secondary,
-                                modifier = Modifier.padding(top = 4.dp, bottom = 12.dp)
+                                color = MaterialTheme.colorScheme.onSurfaceVariant,
+                                modifier = Modifier.padding(bottom = 8.dp)
                             )
 
-                            Button(
-                                onClick = {
-                                    viewModel.loginWithPhone(phoneNumber)
-                                    onLoginSuccess()
-                                },
-                                modifier = Modifier.fillMaxWidth().height(48.dp).testTag("verify_login_btn")
+                            Row(
+                                modifier = Modifier.fillMaxWidth(),
+                                horizontalArrangement = Arrangement.spacedBy(8.dp)
                             ) {
-                                Icon(Icons.Default.VerifiedUser, contentDescription = null)
-                                Spacer(modifier = Modifier.width(8.dp))
-                                Text(AppLanguage.verifyAndLogin(lang), fontSize = 16.sp, fontWeight = FontWeight.Bold)
+                                // Resend OTP button
+                                OutlinedButton(
+                                    onClick = {
+                                        val activity = context as? Activity ?: return@OutlinedButton
+                                        isAuthLoading = true
+                                        otpCode = ""
+                                        errorMessage = ""
+                                        val callbacks = object : PhoneAuthProvider.OnVerificationStateChangedCallbacks() {
+                                            override fun onVerificationCompleted(credential: PhoneAuthCredential) {
+                                                isAuthLoading = true
+                                                viewModel.signInWithPhoneCredential(credential) { ok, err ->
+                                                    isAuthLoading = false
+                                                    if (ok) onLoginSuccess()
+                                                    else errorMessage = err ?: "Login failed"
+                                                }
+                                            }
+                                            override fun onVerificationFailed(e: com.google.firebase.FirebaseException) {
+                                                isAuthLoading = false
+                                                errorMessage = e.localizedMessage ?: "Resend failed"
+                                            }
+                                            override fun onCodeSent(vId: String, token: PhoneAuthProvider.ForceResendingToken) {
+                                                isAuthLoading = false
+                                                verificationId = vId
+                                                resendToken = token
+                                            }
+                                        }
+                                        viewModel.firebaseAuthRepository.sendPhoneOtp(
+                                            activity = activity,
+                                            phoneNumber = phoneNumber.trim(),
+                                            callbacks = callbacks,
+                                            forceResendingToken = resendToken
+                                        )
+                                    },
+                                    modifier = Modifier.weight(1f).height(48.dp).testTag("resend_otp_btn"),
+                                    enabled = !isAuthLoading
+                                ) {
+                                    Icon(Icons.Default.Refresh, contentDescription = null, modifier = Modifier.size(16.dp))
+                                    Spacer(modifier = Modifier.width(4.dp))
+                                    Text(if (lang == Language.BN) "পুনরায় পাঠান" else "Resend", fontSize = 13.sp)
+                                }
+
+                                Button(
+                                    onClick = {
+                                        val vId = verificationId
+                                        if (vId == null) {
+                                            errorMessage = if (lang == Language.BN) "ওটিপি পাওয়া যায়নি" else "Verification ID missing. Please request OTP again."
+                                            return@Button
+                                        }
+                                        if (otpCode.length < 6) {
+                                            errorMessage = if (lang == Language.BN) "৬ সংখ্যার ওটিপি দিন" else "Enter the 6-digit OTP code"
+                                            return@Button
+                                        }
+                                        isAuthLoading = true
+                                        errorMessage = ""
+                                        viewModel.signInWithPhoneOtp(vId, otpCode.trim()) { ok, err ->
+                                            isAuthLoading = false
+                                            if (ok) {
+                                                onLoginSuccess()
+                                            } else {
+                                                errorMessage = err ?: if (lang == Language.BN) "নিবাসী প্রোফাইল পাওয়া যায়নি" else "No resident profile found"
+                                            }
+                                        }
+                                    },
+                                    enabled = !isAuthLoading,
+                                    modifier = Modifier.weight(2f).height(48.dp).testTag("verify_login_btn")
+                                ) {
+                                    if (isAuthLoading) {
+                                        CircularProgressIndicator(modifier = Modifier.size(20.dp), color = Color.White)
+                                        Spacer(modifier = Modifier.width(8.dp))
+                                        Text(if (lang == Language.BN) "যাচাই হচ্ছে..." else "Verifying...", fontSize = 14.sp)
+                                    } else {
+                                        Icon(Icons.Default.VerifiedUser, contentDescription = null)
+                                        Spacer(modifier = Modifier.width(8.dp))
+                                        Text(AppLanguage.verifyAndLogin(lang), fontSize = 15.sp, fontWeight = FontWeight.Bold)
+                                    }
+                                }
                             }
                         }
                     }

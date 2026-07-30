@@ -29,6 +29,7 @@ class FirestoreRepository {
     }
 
     private val usersCollection get() = firestore?.collection("users")
+    private val usersPublicCollection get() = firestore?.collection("users_public")
     private val financialsCollection get() = firestore?.collection("financials")
     private val announcementsCollection get() = firestore?.collection("announcements")
     private val complaintsCollection get() = firestore?.collection("complaints")
@@ -197,10 +198,30 @@ class FirestoreRepository {
     }
 
     /**
-     * Real-time stream of all users from Firestore.
+     * Real-time stream of all users from Firestore (private collection, admin/owner only).
      */
     fun getUsersStream(): Flow<List<UserEntity>> {
         val collection = usersCollection ?: return emptyFlow()
+        return callbackFlow {
+            val listener = collection.addSnapshotListener { snapshot, error ->
+                if (error != null) {
+                    close(error)
+                    return@addSnapshotListener
+                }
+                val users = snapshot?.documents?.mapNotNull { doc ->
+                    doc.toObject(UserEntity::class.java)
+                } ?: emptyList()
+                trySend(users)
+            }
+            awaitClose { listener.remove() }
+        }
+    }
+
+    /**
+     * Real-time stream of public resident roster entries from 'users_public' collection for Directory search.
+     */
+    fun getPublicUsersStream(): Flow<List<UserEntity>> {
+        val collection = usersPublicCollection ?: return emptyFlow()
         return callbackFlow {
             val listener = collection.addSnapshotListener { snapshot, error ->
                 if (error != null) {

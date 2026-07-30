@@ -10,6 +10,7 @@
  */
 
 const { onCall, onRequest, HttpsError } = require("firebase-functions/v2/https");
+const { onDocumentWritten } = require("firebase-functions/v2/firestore");
 const { setGlobalOptions } = require("firebase-functions/v2");
 const admin = require("firebase-admin");
 const bkash = require("./bkash");
@@ -644,3 +645,42 @@ exports.updateComplaintStatus = onCall(async (request) => {
 
   return { success: true };
 });
+
+// ---------------------------------------------------------------------------
+// Firestore Triggers — Automatic Public Profile Sync
+// ---------------------------------------------------------------------------
+
+/**
+ * Automatically syncs non-sensitive public profile fields from `users/{userId}` to
+ * `users_public/{userId}` whenever a user document is created, updated, or deleted.
+ * Ensures the Resident Directory has access to public resident roster data without
+ * exposing private NID/DOB or contact details.
+ */
+exports.syncPublicUser = onDocumentWritten("users/{userId}", async (event) => {
+  const userId = event.params.userId;
+  const afterData = event.data.after && event.data.after.exists ? event.data.after.data() : null;
+
+  if (!afterData) {
+    // Document deleted -> remove public directory entry
+    await db.collection("users_public").doc(userId).delete();
+    return;
+  }
+
+  const publicData = {
+    firebaseUid: afterData.firebaseUid || "",
+    nameEn: afterData.nameEn || "",
+    nameBn: afterData.nameBn || afterData.nameEn || "",
+    holding: afterData.holding || "",
+    road: afterData.road || "",
+    block: afterData.block || "",
+    primaryContact: afterData.primaryContact || afterData.phone || "",
+    professionEn: afterData.professionEn || "",
+    membershipStatus: afterData.membershipStatus || "Pending",
+    role: afterData.role || "NEW_MEMBER",
+    profilePicUrl: afterData.profilePicUrl || "",
+    updatedAt: admin.firestore.FieldValue.serverTimestamp(),
+  };
+
+  await db.collection("users_public").doc(userId).set(publicData, { merge: true });
+});
+

@@ -6,10 +6,13 @@ import androidx.lifecycle.viewModelScope
 import com.example.data.db.AppDatabase
 import com.example.data.model.*
 import com.example.data.repository.ClubRepository
+import com.example.data.repository.FirebaseAuthRepository
 import com.example.data.repository.FirestoreRepository
 import com.example.data.repository.FunctionsRepository
 import com.example.ui.language.Language
 import com.google.firebase.auth.FirebaseAuth
+import com.google.firebase.auth.FirebaseUser
+import com.google.firebase.auth.PhoneAuthCredential
 import com.google.firebase.auth.UserProfileChangeRequest
 import kotlinx.coroutines.flow.*
 import kotlinx.coroutines.launch
@@ -18,6 +21,7 @@ import kotlinx.coroutines.tasks.await
 class ClubViewModel(application: Application) : AndroidViewModel(application) {
     private val repository = ClubRepository(AppDatabase.getDatabase(application))
     private val firestoreRepository = FirestoreRepository()
+    val firebaseAuthRepository = FirebaseAuthRepository()
     // Everything that used to be a direct, client-trusted Firestore write (roles,
     // payment status, complaint resolution) now goes through here instead — see
     // FunctionsRepository + functions/index.js for the server-side enforcement.
@@ -35,7 +39,7 @@ class ClubViewModel(application: Application) : AndroidViewModel(application) {
     val isUsersOfflineCached: StateFlow<Boolean> = _isUsersOfflineCached.asStateFlow()
     
     val allUsers: StateFlow<List<UserEntity>> = combine(
-        firestoreRepository.getUsersStream().catch { emit(emptyList()) },
+        firestoreRepository.getPublicUsersStream().catch { emit(emptyList()) },
         repository.allUsers
     ) { firestoreUsers, roomUsers ->
         if (firestoreUsers.isNotEmpty()) {
@@ -96,26 +100,22 @@ class ClubViewModel(application: Application) : AndroidViewModel(application) {
     }.stateIn(viewModelScope, SharingStarted.WhileSubscribed(5000), emptyList())
 
     init {
-        // Restore Firebase Auth session on cold start.
-        // This covers the case where the user was already logged in before the app was killed:
-        // Firebase SDK persists the token, so we just need to map the UID → resident profile.
-        val firebaseAuth = FirebaseAuth.getInstance()
-        val existingFirebaseUser = firebaseAuth.currentUser
-        if (existingFirebaseUser != null) {
-            viewModelScope.launch {
-                val cachedUser = repository.getUserByFirebaseUid(existingFirebaseUser.uid)
-                    ?: allUsers.value.firstOrNull { it.firebaseUid == existingFirebaseUser.uid }
-                if (cachedUser != null) {
-                    currentUser.value = cachedUser
+        // Restore Firebase Auth session on cold start safely.
+        try {
+            val firebaseAuth = FirebaseAuth.getInstance()
+            val existingFirebaseUser = firebaseAuth.currentUser
+            if (existingFirebaseUser != null) {
+                viewModelScope.launch {
+                    val cachedUser = repository.getUserByFirebaseUid(existingFirebaseUser.uid)
+                        ?: allUsers.value.firstOrNull { it.firebaseUid == existingFirebaseUser.uid }
+                    if (cachedUser != null) {
+                        currentUser.value = cachedUser
+                    }
                 }
-                // If null: the Firestore snapshot listener (allUsers stream) will update the
-                // cache shortly. The UI will remain on the AuthScreen until that resolves or
-                // the user explicitly logs in again.
             }
+        } catch (e: Exception) {
+            e.printStackTrace()
         }
-        // Note: seedInitialDataIfNeeded() is intentionally NOT called here.
-        // Seeding hardcoded mock users into Room was bypassing Firebase Auth — real resident
-        // profiles come from Firestore via the Cloud Function registerResident, not local seeds.
     }
 
     fun toggleLanguage() {
@@ -131,48 +131,69 @@ class ClubViewModel(application: Application) : AndroidViewModel(application) {
     }
 
     /**
-     * Phone/OTP login. Role is NEVER taken from the client: an existing account keeps
-     * whatever role Firestore/the Admin already assigned it, and any brand-new account
-     * is always created as "New Member" / "Pending" — the only way to reach Admin is the
-     * server-side setUserRole path (see functions/index.js), gated on an existing admin.
+     * Called after Firebase Phone Auth succeeds on the client side.
+     * Resolves the resident profile by Firebase UID from cache → in-memory StateFlow
+     * → Firestore directly (for first logins before the snapshot loads).
+     * This never fabricates a local user with mock data — if no resident profile
+     * exists yet, the user is told to complete registration via registerResident.
      */
-    fun loginWithPhone(phone: String) {
+    fun loginWithFirebaseUser(
+        firebaseUser: FirebaseUser,
+        onResult: (Boolean, String?) -> Unit
+    ) {
         viewModelScope.launch {
-            val existing = repository.getUserByPhone(phone)
-            if (existing != null) {
-                currentUser.value = existing
+            val resolved = repository.getUserByFirebaseUid(firebaseUser.uid)
+                ?: allUsers.value.firstOrNull { it.firebaseUid == firebaseUser.uid }
+                ?: firestoreRepository.getUserByFirebaseUid(firebaseUser.uid)
+
+            if (resolved != null) {
+                currentUser.value = resolved
+                repository.cacheUsers(listOf(resolved))
+                onResult(true, null)
             } else {
-                val newId = "USR-${System.currentTimeMillis().toString().takeLast(4)}"
-                val newUser = UserEntity(
-                    id = newId,
-                    phone = phone,
-                    nameEn = "Member ($phone)",
-                    nameBn = "সদস্য ($phone)",
-                    dob = "1992-01-01",
-                    bloodGroup = "O+",
-                    professionEn = "Resident Member",
-                    professionBn = "আবাসিক নিবাসী",
-                    road = "Road 01",
-                    block = "Block A",
-                    floor = "2nd Floor",
-                    holding = "Holding 15",
-                    primaryContact = phone,
-                    emergencyContact = phone,
-                    fatherOrSpouseNameEn = "Guardian Name",
-                    fatherOrSpouseNameBn = "অভিভাবকের নাম",
-                    motherNameEn = "Mother Name",
-                    motherNameBn = "মাতার নাম",
-                    familyMembersCount = 3,
-                    membershipStatus = "Pending", // requires admin approval — see approveUserMembership
-                    role = com.example.data.model.Roles.NEW_MEMBER,
-                    profilePicUrl = "",
-                    nidFrontUrl = "NID-$newId",
-                    nidBackUrl = "NID-BACK-$newId",
-                    joinedDate = "2026-07-25"
-                )
-                repository.insertUser(newUser)
-                currentUser.value = newUser
+                // Phone-authed Firebase account with no resident profile yet.
+                // Direct to email registration to create a proper Firestore profile.
+                onResult(false, "No resident profile found. Please register with email/password to complete your profile.")
             }
+        }
+    }
+
+    fun signInWithPhoneCredential(
+        credential: PhoneAuthCredential,
+        onResult: (Boolean, String?) -> Unit
+    ) {
+        viewModelScope.launch {
+            firebaseAuthRepository.signInWithCredential(credential)
+                .onSuccess { fbUser ->
+                    if (fbUser != null) {
+                        loginWithFirebaseUser(fbUser, onResult)
+                    } else {
+                        onResult(false, "Phone authentication returned no user profile")
+                    }
+                }
+                .onFailure { e ->
+                    onResult(false, e.localizedMessage ?: "Phone authentication failed")
+                }
+        }
+    }
+
+    fun signInWithPhoneOtp(
+        verificationId: String,
+        otpCode: String,
+        onResult: (Boolean, String?) -> Unit
+    ) {
+        viewModelScope.launch {
+            firebaseAuthRepository.signInWithOtp(verificationId, otpCode)
+                .onSuccess { fbUser ->
+                    if (fbUser != null) {
+                        loginWithFirebaseUser(fbUser, onResult)
+                    } else {
+                        onResult(false, "Phone authentication returned no user profile")
+                    }
+                }
+                .onFailure { e ->
+                    onResult(false, e.localizedMessage ?: "Invalid or expired OTP code")
+                }
         }
     }
 
@@ -576,6 +597,67 @@ class ClubViewModel(application: Application) : AndroidViewModel(application) {
             repository.insertActivityLog(log)
             firestoreRepository.addActivityLog(log)
             onResult(true, null)
+        }
+    }
+
+    /**
+     * Sign in using a PhoneAuthCredential (e.g. from instant SIM auto-verification).
+     * On success resolves the resident profile by Firebase UID.
+     */
+    fun signInWithPhoneCredential(
+        credential: PhoneAuthCredential,
+        onResult: (Boolean, String?) -> Unit
+    ) {
+        viewModelScope.launch {
+            try {
+                val result = firebaseAuthRepository.signInWithCredential(credential)
+                val firebaseUser = result.getOrNull()
+                if (firebaseUser == null) {
+                    onResult(false, result.exceptionOrNull()?.message ?: "Sign-in failed")
+                    return@launch
+                }
+                val profile = repository.getUserByFirebaseUid(firebaseUser.uid)
+                    ?: allUsers.value.firstOrNull { it.firebaseUid == firebaseUser.uid }
+                if (profile != null) {
+                    currentUser.value = profile
+                    onResult(true, null)
+                } else {
+                    onResult(false, "No resident profile found for this phone number.")
+                }
+            } catch (e: Exception) {
+                onResult(false, e.message ?: "Sign-in failed")
+            }
+        }
+    }
+
+    /**
+     * Sign in using the verificationId + 6-digit OTP code the user typed.
+     * On success resolves the resident profile by Firebase UID.
+     */
+    fun signInWithPhoneOtp(
+        verificationId: String,
+        code: String,
+        onResult: (Boolean, String?) -> Unit
+    ) {
+        viewModelScope.launch {
+            try {
+                val result = firebaseAuthRepository.signInWithOtp(verificationId, code)
+                val firebaseUser = result.getOrNull()
+                if (firebaseUser == null) {
+                    onResult(false, result.exceptionOrNull()?.message ?: "OTP sign-in failed")
+                    return@launch
+                }
+                val profile = repository.getUserByFirebaseUid(firebaseUser.uid)
+                    ?: allUsers.value.firstOrNull { it.firebaseUid == firebaseUser.uid }
+                if (profile != null) {
+                    currentUser.value = profile
+                    onResult(true, null)
+                } else {
+                    onResult(false, "No resident profile found for this phone number.")
+                }
+            } catch (e: Exception) {
+                onResult(false, e.message ?: "OTP sign-in failed")
+            }
         }
     }
 }

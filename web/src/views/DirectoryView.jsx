@@ -19,7 +19,7 @@ export default function DirectoryView({ lang }) {
   const [loading, setLoading] = useState(true);
 
   useEffect(() => {
-    const q = query(collection(db, 'users'), where('membershipStatus', '==', 'Active'));
+    const q = query(collection(db, 'users_public'), where('membershipStatus', '==', 'Active'));
     const unsub = onSnapshot(
       q,
       (snap) => {
